@@ -6,7 +6,7 @@ queue reconstruction. A closed bar can only create orders for a later bar open.
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
@@ -98,6 +98,109 @@ class BacktestResult:
             if isinstance(x, (list,tuple)): return [convert(v) for v in x]
             return x
         return convert(asdict(self))
+
+    def frictional_summary(self) -> dict:
+        from engine.fee_model import get_ashare_rates_for_date
+        from zoneinfo import ZoneInfo
+        sh_tz = ZoneInfo("Asia/Shanghai")
+
+        total_turnover = Decimal('0.0')
+        buy_turnover = Decimal('0.0')
+        sell_turnover = Decimal('0.0')
+        total_fee = Decimal('0.0')
+        stamp_duty = Decimal('0.0')
+        transfer_fee = Decimal('0.0')
+        proportional_commission = Decimal('0.0')
+        min_commission_drag = Decimal('0.0')
+
+        for f in self.fills:
+            qty = Decimal(str(f['quantity']))
+            px = Decimal(str(f['price']))
+            val = qty * px
+            fee = Decimal(str(f['fee']))
+            side = str(f['side']).upper()
+            total_turnover += val
+            total_fee += fee
+
+            time_ns = f.get('time')
+            trade_date = None
+            if time_ns:
+                dt = datetime.fromtimestamp(time_ns / 1e9, sh_tz)
+                trade_date = str(dt.date())
+
+            rates = get_ashare_rates_for_date(trade_date)
+            t_fee = (val * rates['transfer_fee_rate']).quantize(Decimal('0.0001'))
+            transfer_fee += t_fee
+
+            s_duty = Decimal('0.0')
+            if 'SELL' in side:
+                sell_turnover += val
+                s_duty = (val * rates['stamp_duty_rate']).quantize(Decimal('0.0001'))
+                stamp_duty += s_duty
+            else:
+                buy_turnover += val
+
+            raw_comm = val * rates['commission_rate']
+            proportional_commission += raw_comm
+            actual_comm = fee - (t_fee.quantize(Decimal('0.01')) + s_duty.quantize(Decimal('0.01')))
+            if actual_comm > raw_comm:
+                min_commission_drag += (actual_comm - raw_comm)
+
+        rejections_by_reason = {}
+        for r in self.rejections:
+            reason = r.get('reason', 'UNKNOWN')
+            rejections_by_reason[reason] = rejections_by_reason.get(reason, 0) + 1
+
+        total_commission = proportional_commission + min_commission_drag
+        friction_bps = (total_fee / total_turnover * Decimal('10000')).quantize(Decimal('0.01')) if total_turnover > 0 else Decimal('0.0')
+
+        return {
+            'total_turnover': total_turnover.quantize(Decimal('0.01')),
+            'buy_turnover': buy_turnover.quantize(Decimal('0.01')),
+            'sell_turnover': sell_turnover.quantize(Decimal('0.01')),
+            'total_fee': total_fee.quantize(Decimal('0.01')),
+            'total_commission': total_commission.quantize(Decimal('0.01')),
+            'proportional_commission': proportional_commission.quantize(Decimal('0.01')),
+            'min_commission_drag': min_commission_drag.quantize(Decimal('0.01')),
+            'stamp_duty': stamp_duty.quantize(Decimal('0.01')),
+            'transfer_fees': transfer_fee.quantize(Decimal('0.01')),
+            'total_fills': len(self.fills),
+            'total_rejections': len(self.rejections),
+            'rejections_by_reason': rejections_by_reason,
+            'friction_bps': friction_bps,
+        }
+
+    def attribution_report(self) -> str:
+        s = self.frictional_summary()
+        initial_cash = Decimal(str(self.manifest.get('initial_cash', 0))) if self.manifest else Decimal('0.0')
+        final_equity = Decimal(str(self.daily_nav[-1]['total_equity'])) if self.daily_nav else self.ledger_cash
+        total_pnl = final_equity - initial_cash if initial_cash > 0 else Decimal('0.0')
+        rejections_str = "".join(f"     - {k:<24}: {v:>8d}\n" for k, v in s['rejections_by_reason'].items()) if s['rejections_by_reason'] else "     - None\n"
+        return (
+            "================================================================================\n"
+            "                 ASHARE-NAUTILUS MICROSTRUCTURE FRICTION REPORT                 \n"
+            "================================================================================\n"
+            f" Total Turnover           : {s['total_turnover']:>15,.2f} CNY\n"
+            f"   - Buy Turnover         : {s['buy_turnover']:>15,.2f} CNY\n"
+            f"   - Sell Turnover        : {s['sell_turnover']:>15,.2f} CNY\n"
+            "--------------------------------------------------------------------------------\n"
+            f" Total Statutory Frictions: {s['total_fee']:>15,.2f} CNY ({s['friction_bps']} bps)\n"
+            f"   * Pure Commission (万三): {s['proportional_commission']:>15,.2f} CNY\n"
+            f"   * 5 CNY Min Drag (保底): {s['min_commission_drag']:>15,.2f} CNY\n"
+            f"   * Stamp Duty (印花税)  : {s['stamp_duty']:>15,.2f} CNY\n"
+            f"   * Transfer Fee (过户费): {s['transfer_fees']:>15,.2f} CNY\n"
+            "--------------------------------------------------------------------------------\n"
+            f" Execution Summary        :\n"
+            f"   * Total Fills          : {s['total_fills']:>15d}\n"
+            f"   * Total Rejections     : {s['total_rejections']:>15d}\n"
+            + rejections_str +
+            "--------------------------------------------------------------------------------\n"
+            f" Account Equity           :\n"
+            f"   * Initial Cash         : {initial_cash:>15,.2f} CNY\n"
+            f"   * Final Equity         : {final_equity:>15,.2f} CNY\n"
+            f"   * Net Realized PnL     : {total_pnl:>15,.2f} CNY\n"
+            "================================================================================"
+        )
 
 
 def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_days):
@@ -220,11 +323,12 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
 
 
 class _ResearchStrategy(Strategy):
-    def __init__(self, bars, rules, master, sessions, actions, signal, initial_cash, rate, native, fee_model, cash_module, liquidity, portfolio_signal=None, frozen_orders=None):
+    def __init__(self, bars, rules, master, sessions, actions, signal, initial_cash, rate, native, fee_model, cash_module, liquidity, portfolio_signal=None, frozen_orders=None, cash_exhaustion_policy='reject'):
         super().__init__(StrategyConfig())
         self.bars=bars;self.rules=rules;self.master=master;self.sessions=sessions;self.actions=actions
         self.signal=signal;self.rate=rate;self.native=native;self.fee_model=fee_model;self.cash_module=cash_module
         self.liquidity=liquidity
+        self.cash_exhaustion_policy=cash_exhaustion_policy
         self.buy_reservations={}
         self.liquidity.affordable=self._affordable_quantity
         t0_symbols={s for s in master if self._is_cb(s)}
@@ -437,6 +541,25 @@ class _ResearchStrategy(Strategy):
         return calculate_expected_fee(side,qty,price,is_new_order=before==0,trade_date=str(day),
             cum_trade_val_before=before,rates=self.fee_model.rates_for(symbol,str(day)))
 
+    def _calculate_affordable_lots(self, symbol: str, px: Decimal, requested_qty: int, avail_cash: Decimal, step: int, min_lot: int, day: date) -> int:
+        if avail_cash <= 0 or px <= 0 or requested_qty < min_lot:
+            return 0
+        max_lots = (requested_qty - min_lot) // step
+        lo = 0
+        hi = max_lots
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            test_qty = min_lot + mid * step
+            fee = self._expected_fee('BUY', D(test_qty), px, symbol=symbol, day=day)
+            total = D(test_qty) * px + fee
+            if total <= avail_cash:
+                best = test_qty
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
     def _submit_open(self,tick,phase):
         if not self.pending:return
         symbol=self.by_id[str(tick.instrument_id)];day=datetime.fromtimestamp(tick.ts_event/1e9,TZ).date()
@@ -459,8 +582,24 @@ class _ResearchStrategy(Strategy):
             if side==OrderSide.BUY:
                 cost=D(str(order.price))*intent.quantity
                 cost+=self._expected_fee('BUY',D(intent.quantity),D(str(order.price)),symbol=symbol,day=day)
-                if cost>self.ledger.cash-sum((r['amount'] for r in self.buy_reservations.values()),D(0)):
-                    self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init);continue
+                avail_cash=self.ledger.cash-sum((r['amount'] for r in self.buy_reservations.values()),D(0))
+                if cost>avail_cash:
+                    if self.cash_exhaustion_policy=='auto_trim':
+                        rule=self.rules.get((symbol,day),{})
+                        step=rule.get('buy_step',100)
+                        min_lot=rule.get('buy_min',100)
+                        affordable_qty=self._calculate_affordable_lots(symbol,D(str(order.price)),intent.quantity,avail_cash,step,min_lot,day)
+                        if affordable_qty>=min_lot:
+                            from engine.intents import OrderIntent
+                            intent=OrderIntent(symbol=intent.symbol,side=intent.side,quantity=affordable_qty,limit_price=intent.limit_price,intent_id=intent.intent_id,earliest_execution=intent.earliest_execution)
+                            args['quantity']=Quantity.from_int(intent.quantity)
+                            order=self.order_factory.limit(**args,price=order.price)
+                            cost=D(str(order.price))*intent.quantity
+                            cost+=self._expected_fee('BUY',D(intent.quantity),D(str(order.price)),symbol=symbol,day=day)
+                        else:
+                            self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init);continue
+                    else:
+                        self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init);continue
             r=self.gateway.validate_and_reserve(order,self.rules[(symbol,day)],{'close':tick.ask_price.as_double(),'volume':max(available,1),'execution_ts':tick.ts_init},tick.ask_price.as_double() if side==OrderSide.BUY else tick.bid_price.as_double())
             if r.is_valid:
                 self._sync_account_symbol(symbol)
@@ -566,7 +705,7 @@ class _ResearchStrategy(Strategy):
         self.nav.append(row);self.closed.add(day)
 
 
-def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, _prepared=None, _tape=None):
+def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', _prepared=None, _tape=None):
     """Run one isolated, shared-cash portfolio. Rules keyed by (symbol, local date)."""
     if actions is not None and not corporate_actions:
         corporate_actions = actions
@@ -622,14 +761,14 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             native[symbol]=Equity(instrument_id=InstrumentId(Symbol(symbol),SIM),raw_symbol=Symbol(symbol.split('.')[0]),currency=CNY,price_precision=prec,price_increment=Price.from_str(inc_str),lot_size=Quantity.from_int(i.lot_size),ts_event=nanos(at(sessions[0],0)),ts_init=nanos(at(sessions[0],0)))
             eng.add_instrument(native[symbol])
         if _tape is None:
-            strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal,frozen_orders=frozen_orders)
+            strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal,frozen_orders=frozen_orders,cash_exhaustion_policy=cash_exhaustion_policy)
         else:
             from engine.tape_replay import _TapeStrategy
             strategy=_TapeStrategy(_prepared,_tape,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity)
         eng.add_strategy(strategy)
-        bar_types={};statistics=dict(data_mode=data_mode,market_events=0,boundary_events=0,peak_batch_events=0)
+        bar_types={};statistics=dict(data_mode=data_mode,execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,market_events=0,boundary_events=0,peak_batch_events=0)
         if data_mode=='full':
-            data=build_events(bars,rules,native,participation_rate,liquidity,bar_types)
+            data=build_events(bars,rules,native,participation_rate,liquidity,bar_types,mode=execution_mode)
             statistics.update(market_events=len(data),peak_batch_events=len(data))
             if data:eng.add_data(data)
             eng.run(start=at(sessions[0],0),end=at(sessions[-1],15))
@@ -642,7 +781,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                     day_bars=[b for b in day_bars if b.symbol in selected]
                     strategy.current_bars={b.symbol:b for b in day_bars}
                     statistics['native_market_bars']=statistics.get('native_market_bars',0)+sum(b.volume>0 and rules[b.symbol,day]['trade_status']=='OPEN' for b in day_bars)
-                data=build_events(day_bars,rules,native,participation_rate,liquidity,bar_types,active)
+                data=build_events(day_bars,rules,native,participation_rate,liquidity,bar_types,active,mode=execution_mode)
                 statistics['market_events']+=len(data)
                 statistics['peak_batch_events']=max(statistics['peak_batch_events'],len(data)+1)
                 if data:eng.add_data(data)
@@ -674,14 +813,15 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         finally:eng.dispose()
 
 
-def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full'):
+def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject'):
     """Validate raw inputs and run one isolated shared-cash portfolio."""
     if actions is not None and not corporate_actions:
         corporate_actions = actions
     return _run_backtest(instruments,bars,rules,signal,corporate_actions=corporate_actions,
         initial_cash=initial_cash,participation_rate=participation_rate,trading_days=trading_days,
         fee_model=fee_model,portfolio_signal=portfolio_signal,slippage_bps=slippage_bps,
-        strategy_id=strategy_id,strategy_params=strategy_params,data_snapshot_id=data_snapshot_id,data_mode=data_mode)
+        strategy_id=strategy_id,strategy_params=strategy_params,data_snapshot_id=data_snapshot_id,data_mode=data_mode,
+        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy)
 
 
 def run_prepared_backtest(prepared, signal=None, **run_options):
@@ -696,7 +836,8 @@ def run_prepared_backtest(prepared, signal=None, **run_options):
 def run_frozen_orders_backtest(
     instruments, bars, rules, frozen_orders, *,
     corporate_actions=(), actions=None, initial_cash=D(100000),
-    participation_rate=.01, trading_days=None, fee_model=None, data_mode='full', **kwargs
+    participation_rate=.01, trading_days=None, fee_model=None, data_mode='full',
+    execution_mode='synthetic_l2', cash_exhaustion_policy='reject', **kwargs
 ) -> BacktestResult:
     """Run backtest directly executing frozen orders from upstream (e.g. VectorBT)."""
     if actions is not None and not corporate_actions:
@@ -704,6 +845,7 @@ def run_frozen_orders_backtest(
     return _run_backtest(
         instruments, bars, rules, signal=None, corporate_actions=corporate_actions,
         initial_cash=initial_cash, participation_rate=participation_rate, trading_days=trading_days,
-        fee_model=fee_model, data_mode=data_mode, frozen_orders=frozen_orders, **kwargs
+        fee_model=fee_model, data_mode=data_mode, frozen_orders=frozen_orders,
+        execution_mode=execution_mode, cash_exhaustion_policy=cash_exhaustion_policy, **kwargs
     )
 

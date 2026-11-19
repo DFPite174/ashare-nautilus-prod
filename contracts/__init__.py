@@ -13,6 +13,12 @@ from contracts.models import (
     BacktestSummary,
     FrozenOrder,
 )
+from contracts.adapters import (
+    from_dataframe,
+    from_target_weights_df,
+    from_vectorbt_portfolio,
+    from_qlib_predictions,
+)
 
 __all__ = [
     "AssetClass",
@@ -28,4 +34,8 @@ __all__ = [
     "DailyNAV",
     "BacktestSummary",
     "FrozenOrder",
+    "from_dataframe",
+    "from_target_weights_df",
+    "from_vectorbt_portfolio",
+    "from_qlib_predictions",
 ]

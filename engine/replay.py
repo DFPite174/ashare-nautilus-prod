@@ -22,7 +22,7 @@ def session_boundary(timestamp):
     return CustomData(DataType(_SessionBoundary),_SessionBoundary(timestamp))
 
 
-def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None):
+def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,mode='synthetic_l2'):
     from engine.backtest import TZ,at,nanos
     data=[];rate=Decimal(str(rate))
     for b in sorted(bars,key=lambda item:(item.start,item.symbol)):
@@ -33,12 +33,15 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None)
         detailed=active_symbols is None or b.symbol in active_symbols
         if detailed:
             for ts in (start,start+1):liquidity.events[(iid,ts)]=(key,cap,False)
-            for ts in (end-3,end-2,end-1,end):liquidity.events[(iid,ts)]=(key,cap,True)
             price=Price.from_str(format(b.open,px_fmt))
             data.append(synthetic_book(inst,price,cap,start))
             data.append(QuoteTick(inst.id,price,price,Quantity.from_int(cap),Quantity.from_int(cap),start,start+1))
-            for ts,value in zip((end-3,end-2,end-1),(b.high,b.low,b.close)):
-                data.append(synthetic_book(inst,Price.from_str(format(value,px_fmt)),cap,ts))
+            if mode != 'auction_open':
+                for ts in (end-3,end-2,end-1,end):liquidity.events[(iid,ts)]=(key,cap,True)
+                for ts,value in zip((end-3,end-2,end-1),(b.high,b.low,b.close)):
+                    data.append(synthetic_book(inst,Price.from_str(format(value,px_fmt)),cap,ts))
+            else:
+                liquidity.events[(iid,end)]=(key,cap,True)
         else:
             # NT's L2 input contract needs a book event, even for an idle symbol.
             liquidity.events[(iid,start)]=(key,cap,False)
