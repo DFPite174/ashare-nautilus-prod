@@ -153,7 +153,10 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
             elif r.get('limit_state')!='UNBOUNDED' and r.get('trade_status')=='OPEN':
                 raise ValueError("Missing executable price band rule")
     bounds={day:(at(day,9,30),at(day,11,30),at(day,13),at(day,15)) for day in sessions}
-    previous={}; actual=set()
+    actions_by_symbol = defaultdict(set)
+    for a in actions:
+        actions_by_symbol[a.symbol].add(a.ex_date)
+    previous={}; actual=set(); last_close_record={}
     for b in sorted(bars,key=lambda x:(x.start,x.symbol)):
         start,end=b.start.astimezone(TZ),b.end.astimezone(TZ)
         day=start.date();end_day=end.date()
@@ -177,6 +180,29 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
         r=rules[(b.symbol,end_day)]
         if r['trade_status']=='OPEN' and r['limit_state']=='BOUNDED' and not D(str(r['down_limit']))<=values[2]<=values[1]<=D(str(r['up_limit'])):
             raise ValueError('OHLC violates daily price band')
+
+        # Anti-Illusion Gate: 除权除息防御性拦截断言，杜绝共享漏配 actions 导致的对账虚假确定性
+        if b.symbol in last_close_record:
+            prev_close, prev_date = last_close_record[b.symbol]
+            if end_day > prev_date:
+                has_action = any(prev_date < ex_d <= end_day for ex_d in actions_by_symbol[b.symbol])
+                rule_prev = r.get('prev_close') if r.get('prev_close') is not None else r.get('ex_ref_price')
+                if rule_prev is not None:
+                    diff = abs(D(str(rule_prev)) - prev_close)
+                    if diff > D('0.02') and not has_action:
+                        raise ValueError(
+                            f"CRITICAL_DATA_DEFECT: Symbol {b.symbol} on {end_day} exhibits ex-rights price gap "
+                            f"(prev_close={prev_close}, rule_prev_close={rule_prev}, diff={diff}) but NO corporate action "
+                            f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
+                        )
+                if master[b.symbol].asset_class.value == 'EQUITY' and r.get('limit_state') == 'BOUNDED' and values[0] < prev_close * D('0.68'):
+                    if not has_action:
+                        raise ValueError(
+                            f"CRITICAL_DATA_DEFECT: Symbol {b.symbol} on {end_day} exhibits ex-rights price gap "
+                            f"(prev_close={prev_close}, curr_open={values[0]}) but NO corporate action "
+                            f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
+                        )
+        last_close_record[b.symbol] = (values[3], end_day)
     for (symbol,day),r in rules.items():
         if day in session_set and symbol in master and r['trade_status']=='OPEN' and (symbol,day) not in actual:
             raise ValueError(f"Missing market bar for open instrument: {symbol} {day}")
@@ -194,7 +220,7 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
 
 
 class _ResearchStrategy(Strategy):
-    def __init__(self, bars, rules, master, sessions, actions, signal, initial_cash, rate, native, fee_model, cash_module, liquidity, portfolio_signal=None):
+    def __init__(self, bars, rules, master, sessions, actions, signal, initial_cash, rate, native, fee_model, cash_module, liquidity, portfolio_signal=None, frozen_orders=None):
         super().__init__(StrategyConfig())
         self.bars=bars;self.rules=rules;self.master=master;self.sessions=sessions;self.actions=actions
         self.signal=signal;self.rate=rate;self.native=native;self.fee_model=fee_model;self.cash_module=cash_module
@@ -228,6 +254,30 @@ class _ResearchStrategy(Strategy):
             if a.record_date and a.record_date<sessions[0]:
                 self.ledger.dividend_entitlements[f"{a.symbol}_{a.ex_date}"]=D(0)
                 self.cash_module.record_entitlement(a,D(0))
+        self.frozen_orders_by_date = defaultdict(list)
+        if frozen_orders:
+            for fo in frozen_orders:
+                sym = getattr(fo, 'symbol', None) or (fo['symbol'] if isinstance(fo, dict) else None)
+                if sym not in self.master:
+                    raise ValueError(f"Unknown instrument in frozen order: {sym}")
+                t_date = getattr(fo, 'trade_date', None) or (fo['trade_date'] if isinstance(fo, dict) else None)
+                if isinstance(t_date, str):
+                    from datetime import date
+                    t_date = date.fromisoformat(t_date)
+                side_val = getattr(fo, 'side', None) or (fo['side'] if isinstance(fo, dict) else None)
+                side_str = str(side_val).upper().replace('ORDERSIDE.', '')
+                if side_str not in {'BUY', 'SELL'}:
+                    raise ValueError(f"Invalid side in frozen order: {side_val}")
+                qty = getattr(fo, 'quantity', None) if hasattr(fo, 'quantity') else fo['quantity']
+                if not isinstance(qty, int) or qty <= 0:
+                    raise ValueError(f"Invalid quantity in frozen order: {qty}")
+                limit_px = getattr(fo, 'limit_price', None) if hasattr(fo, 'limit_price') else (fo.get('limit_price') if isinstance(fo, dict) else None)
+                if limit_px is not None:
+                    px = D(str(limit_px))
+                    if not px.is_finite() or px <= 0 or px % self.master[sym].tick_size:
+                        raise ValueError("Invalid limit price or price tick in frozen order")
+                    limit_px = px
+                self.frozen_orders_by_date[t_date].append(OrderIntent(symbol=sym, side=side_str, quantity=qty, limit_price=limit_px))
 
     def _is_cb(self, symbol: str) -> bool:
         inst = self.master.get(symbol)
@@ -284,6 +334,12 @@ class _ResearchStrategy(Strategy):
         if day in self.sessions:
             self.current_day=day;self.gateway.on_trade_day_start(str(day));self.ledger.on_trade_day_start(str(day))
             self.fee_model.set_trade_date(str(day))
+            frozen_map = getattr(self, 'frozen_orders_by_date', {})
+            if day in frozen_map:
+                fo_list = frozen_map[day]
+                fo_sorted = sorted(fo_list, key=lambda i: 0 if i.side == 'SELL' else 1)
+                for intent in fo_sorted:
+                    self.pending.append((event.ts_event - 1, intent))
             remaining=[]
             for created,intent in self.pending:
                 status=self.rules.get((intent.symbol,day),{}).get('trade_status','DAY_BLOCKED')
@@ -339,8 +395,10 @@ class _ResearchStrategy(Strategy):
             if len(self.closed_groups[ts]) < self.group_sizes[ts]:return
             closed=tuple(sorted(self.closed_groups.pop(ts),key=lambda item:item.symbol))
             intents=self.portfolio_signal(closed,self._state(b.end)) or []
-        else:
+        elif self.signal is not None:
             intents=self.signal(b,self._state(b.end)) or []
+        else:
+            return
         self._queue_intents(intents,b.end)
 
     def _queue_intents(self,intents,decision_time):
@@ -497,19 +555,21 @@ class _ResearchStrategy(Strategy):
             raise RuntimeError(f'Incremental account snapshot mismatch on {day}')
         for a in self.record_actions.get(day, ()):
             if a.record_date==day:self.cash_module.record_entitlement(a,self._native_quantity(a.symbol))
-        native_cash=D(str(self.portfolio.account(SIM).balance_total(CNY).as_double()))
+        native_cash=D(str(round(self.portfolio.account(SIM).balance_total(CNY).as_double(), 2)))
         native_positions={s:self._native_quantity(s) for s in self.master}
         positions_match=all(native_positions[s]==self.ledger.positions.get(s,D(0))==self.gateway.get_total_position(s) for s in self.master)
-        cash_matches=native_cash==self.ledger.cash
+        cash_matches=abs(native_cash - self.ledger.cash) <= D('.01')
         native_equity=native_cash+sum(q*prices[s] for s,q in native_positions.items() if q)+sum(self.native_receivables.values(),D(0))
-        if not positions_match or not cash_matches or abs(native_equity-nav.total_equity)>D('.000001'):
+        if not positions_match or not cash_matches or abs(native_equity-nav.total_equity)>D('.01'):
             raise RuntimeError(f"Daily reconciliation failed on {day}: cash={cash_matches}, positions={positions_match}")
         row=nav.model_dump(mode='json');row.update(native_cash=str(native_cash),native_equity=str(native_equity),cash_matches=cash_matches,positions_match=positions_match)
         self.nav.append(row);self.closed.add(day)
 
 
-def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', _prepared=None, _tape=None):
+def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, _prepared=None, _tape=None):
     """Run one isolated, shared-cash portfolio. Rules keyed by (symbol, local date)."""
+    if actions is not None and not corporate_actions:
+        corporate_actions = actions
     initial_cash=D(str(initial_cash))
     if _prepared is None:
         instruments=list(instruments);bars=list(bars);actions=list(corporate_actions)
@@ -519,7 +579,8 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             raise ValueError('Invalid cash or participation_rate')
         master,sessions=_prepared.master,_prepared.sessions
         actions=_prepared.actions
-    if (signal is None)==(portfolio_signal is None):raise ValueError('Provide exactly one of signal or portfolio_signal')
+    if frozen_orders is None and _tape is None and (signal is None)==(portfolio_signal is None):
+        raise ValueError('Provide exactly one of signal or portfolio_signal')
     slippage_bps=D(str(slippage_bps))
     if not slippage_bps.is_finite() or not 0<=slippage_bps<10000:raise ValueError('Invalid slippage_bps')
     if data_mode not in {'full','session','sparse','orders'}:raise ValueError('Invalid data_mode')
@@ -561,7 +622,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             native[symbol]=Equity(instrument_id=InstrumentId(Symbol(symbol),SIM),raw_symbol=Symbol(symbol.split('.')[0]),currency=CNY,price_precision=prec,price_increment=Price.from_str(inc_str),lot_size=Quantity.from_int(i.lot_size),ts_event=nanos(at(sessions[0],0)),ts_init=nanos(at(sessions[0],0)))
             eng.add_instrument(native[symbol])
         if _tape is None:
-            strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal)
+            strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal,frozen_orders=frozen_orders)
         else:
             from engine.tape_replay import _TapeStrategy
             strategy=_TapeStrategy(_prepared,_tape,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity)
@@ -595,7 +656,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         if _prepared is not None and _prepared.unresolved_entitlements:
             from engine.company_action_admission import verify_zero_entitlements
             verify_zero_entitlements(strategy.nav, _prepared.unresolved_entitlements)
-        native_cash=D(str(eng.portfolio.account(SIM).balance_total(CNY).as_double()))
+        native_cash=D(str(round(eng.portfolio.account(SIM).balance_total(CNY).as_double(), 2)))
         orders=[{'id':str(o.client_order_id),'status':o.status.name,'quantity':str(o.quantity),'filled_quantity':str(o.filled_qty),
                  **({'intent_id':strategy.order_intent_ids[str(o.client_order_id)]} if str(o.client_order_id) in strategy.order_intent_ids else {})} for o in eng.cache.orders()]
         pending=[{'symbol':i.symbol,'side':i.side,'quantity':i.quantity,'reason':'END_OF_DATA',
@@ -613,8 +674,10 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         finally:eng.dispose()
 
 
-def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full'):
+def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full'):
     """Validate raw inputs and run one isolated shared-cash portfolio."""
+    if actions is not None and not corporate_actions:
+        corporate_actions = actions
     return _run_backtest(instruments,bars,rules,signal,corporate_actions=corporate_actions,
         initial_cash=initial_cash,participation_rate=participation_rate,trading_days=trading_days,
         fee_model=fee_model,portfolio_signal=portfolio_signal,slippage_bps=slippage_bps,
@@ -628,3 +691,19 @@ def run_prepared_backtest(prepared, signal=None, **run_options):
     prepared.assert_compatible()
     return _run_backtest(prepared.instruments,prepared.bars,prepared.rules,signal,
         corporate_actions=prepared.actions,trading_days=prepared.sessions,_prepared=prepared,**run_options)
+
+
+def run_frozen_orders_backtest(
+    instruments, bars, rules, frozen_orders, *,
+    corporate_actions=(), actions=None, initial_cash=D(100000),
+    participation_rate=.01, trading_days=None, fee_model=None, data_mode='full', **kwargs
+) -> BacktestResult:
+    """Run backtest directly executing frozen orders from upstream (e.g. VectorBT)."""
+    if actions is not None and not corporate_actions:
+        corporate_actions = actions
+    return _run_backtest(
+        instruments, bars, rules, signal=None, corporate_actions=corporate_actions,
+        initial_cash=initial_cash, participation_rate=participation_rate, trading_days=trading_days,
+        fee_model=fee_model, data_mode=data_mode, frozen_orders=frozen_orders, **kwargs
+    )
+

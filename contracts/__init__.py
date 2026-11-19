@@ -11,6 +11,7 @@ from contracts.models import (
     Fill,
     DailyNAV,
     BacktestSummary,
+    FrozenOrder,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "Fill",
     "DailyNAV",
     "BacktestSummary",
+    "FrozenOrder",
 ]

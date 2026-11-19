@@ -130,6 +130,8 @@ class AShareFeeModel(FeeModel):
         self._custom_min_comm = Decimal(str(min_commission)) if min_commission is not None else None
         self._custom_stamp_rate = Decimal(str(stamp_duty_rate)) if stamp_duty_rate is not None else None
         self._custom_transfer_rate = Decimal(str(transfer_fee_rate)) if transfer_fee_rate is not None else None
+        self._explicit_stamp_duty = stamp_duty_rate is not None
+        self._explicit_transfer_fee = transfer_fee_rate is not None
         self.currency = currency
         self.scope_id = scope_id
         self.current_trade_date = current_trade_date
@@ -194,16 +196,8 @@ class AShareFeeModel(FeeModel):
 
         comm_rate = self._custom_comm_rate if self._custom_comm_rate is not None else matched["commission_rate"]
         min_comm = self._custom_min_comm if self._custom_min_comm is not None else matched["min_commission"]
-        # 如果未显式覆盖印花税，或显式传入了基准 0.0005，则根据历史分水岭自动匹配
-        if self._custom_stamp_rate is not None and self._custom_stamp_rate != Decimal("0.0005"):
-            stamp_rate = self._custom_stamp_rate
-        else:
-            stamp_rate = matched["stamp_duty_rate"]
-
-        if self._custom_transfer_rate is not None and self._custom_transfer_rate != Decimal("0.00001"):
-            transfer_rate = self._custom_transfer_rate
-        else:
-            transfer_rate = matched["transfer_fee_rate"]
+        stamp_rate = self._custom_stamp_rate if self._explicit_stamp_duty else matched["stamp_duty_rate"]
+        transfer_rate = self._custom_transfer_rate if self._explicit_transfer_fee else matched["transfer_fee_rate"]
 
         return comm_rate, min_comm, stamp_rate, transfer_rate
 
@@ -298,7 +292,7 @@ class ConvertibleBondFeeModel(AShareFeeModel):
         matched = get_cb_rates_for_date(order_date)
         comm_rate = self._custom_comm_rate if self._custom_comm_rate is not None else matched["commission_rate"]
         min_comm = self._custom_min_comm if self._custom_min_comm is not None else matched["min_commission"]
-        stamp_rate = self._custom_stamp_rate if self._custom_stamp_rate is not None else matched["stamp_duty_rate"]
-        transfer_rate = self._custom_transfer_rate if self._custom_transfer_rate is not None else matched["transfer_fee_rate"]
+        stamp_rate = self._custom_stamp_rate if self._explicit_stamp_duty else matched["stamp_duty_rate"]
+        transfer_rate = self._custom_transfer_rate if self._explicit_transfer_fee else matched["transfer_fee_rate"]
         return comm_rate, min_comm, stamp_rate, transfer_rate
 

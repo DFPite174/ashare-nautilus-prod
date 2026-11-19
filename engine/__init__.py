@@ -21,7 +21,16 @@ from engine.fee_model import (
 )
 from engine.golden_ledger import GoldenLedger
 from engine.order_gateway import AShareOrderGateway, OrderValidationResult
-from engine.backtest import BacktestBar, OrderIntent, ResearchState, BacktestResult, run_backtest, run_prepared_backtest
+from contracts.models import FrozenOrder
+from engine.backtest import (
+    BacktestBar,
+    OrderIntent,
+    ResearchState,
+    BacktestResult,
+    run_backtest,
+    run_prepared_backtest,
+    run_frozen_orders_backtest,
+)
 from engine.prepared import PreparedBacktest, prepare_backtest
 from engine.comparison import compare_backtests, compare_complete_backtests
 from engine.rebalance import RebalancePlan, PlannedAllocation, plan_rebalance
@@ -44,7 +53,8 @@ __all__ = [
     "GoldenLedger",
     "AShareOrderGateway",
     "OrderValidationResult",
-    "BacktestBar", "OrderIntent", "ResearchState", "BacktestResult", "run_backtest",
+    "FrozenOrder",
+    "BacktestBar", "OrderIntent", "ResearchState", "BacktestResult", "run_backtest", "run_frozen_orders_backtest",
     "RebalancePlan", "PlannedAllocation", "plan_rebalance",
     "PreparedBacktest", "prepare_backtest", "run_prepared_backtest", "compare_backtests", "compare_complete_backtests",
     "TimedOrderIntent", "PreparedOrderTape", "prepare_order_tape", "run_order_tape",

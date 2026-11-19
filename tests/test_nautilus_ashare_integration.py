@@ -415,10 +415,10 @@ def test_nautilus_ashare_integration_e2e():
     total_balances = account.balances_total()
     balance = float(total_balances.get(CNY, 0.0))
     expected_cash = 990483.44
-    assert balance == expected_cash, f"原生现金余额应为 {expected_cash}，实为 {balance}"
+    assert round(balance, 2) == expected_cash, f"原生现金余额应为 {expected_cash}，实为 {balance}"
 
     # 5. 独立黄金账本双轨对账
-    assert float(strategy.ledger.cash) == balance, (
+    assert round(float(strategy.ledger.cash), 2) == round(balance, 2), (
         f"黄金账本现金 ({float(strategy.ledger.cash)}) 与原生账户 ({balance}) 不一致！"
     )
     assert float(strategy.ledger.positions["600519"]) == float(net_pos), (

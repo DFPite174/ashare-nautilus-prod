@@ -251,3 +251,19 @@ class BacktestSummary(BaseModel):
     fill_count: int
     direct_match: bool = Field(default=False, description="是否经过独立参考账本精准比对")
     snapshot_id: str = Field(default="")
+
+
+class FrozenOrder(BaseModel):
+    """
+    预固化/静态订单契约 (Frozen Order Contract)
+    支撑上游 (VectorBT/组合优化器) 离线生成确定性订单后，直接交由下游事件引擎高速回放。
+    """
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str = Field(..., description="证券代码")
+    trade_date: date = Field(..., description="拟执行交易日 (即撮合成交的日期)")
+    side: str = Field(..., description="买卖方向: 'BUY' 或 'SELL'")
+    quantity: int = Field(..., description="委托股数")
+    limit_price: Optional[Decimal] = Field(default=None, description="限价价格，None 为开盘市价")
+    client_order_id: Optional[str] = Field(default=None, description="自定义订单客户端ID")
+
