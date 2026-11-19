@@ -24,13 +24,13 @@ def test_out_of_band_ohlc_rejected():
 
 def test_actual_executing_bar_volume_caps_fills():
     bars,rules=fixture()
-    bars[1]=replace(bars[1],volume=1)
+    bars[1]=replace(bars[1],volume=1,open_volume=1)
     r=run_backtest([INST],bars,rules,buy_first(bars),participation_rate=1)
     assert sum(D(x['quantity']) for x in r.fills)<=1
 
 def test_competing_orders_share_open_and_ohlc_volume():
     bars,rules=fixture()
-    bars[1]=replace(bars[1],volume=150)
+    bars[1]=replace(bars[1],volume=150,open_volume=150)
     def signal(b,s):
         if b.end==bars[0].end:return [OrderIntent(b.symbol,'BUY',100,D('10.5')),OrderIntent(b.symbol,'BUY',100,D('10.5'))]
         return []

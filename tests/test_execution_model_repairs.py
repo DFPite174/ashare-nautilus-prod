@@ -18,7 +18,7 @@ def market(days=4):
 @pytest.mark.parametrize('cap',[0,1,50,150,199,200])
 @pytest.mark.parametrize('limit',[D('10.00'),D('10.20')])
 def test_competing_buys_never_exceed_budget_or_limit(cap,limit):
-    bars,rules=market();bars[1]=replace(bars[1],volume=cap)
+    bars,rules=market();bars[1]=replace(bars[1],volume=cap,open_volume=cap)
     def signal(b,s):return [OrderIntent(b.symbol,'BUY',100,limit)]*2 if b==bars[0] else []
     r=run_backtest([INST],bars,rules,signal,participation_rate=1)
     assert sum(D(x['quantity']) for x in r.fills)==min(cap,200)
@@ -28,7 +28,7 @@ def test_competing_buys_never_exceed_budget_or_limit(cap,limit):
 
 @pytest.mark.parametrize('cap',[0,1,50,150,199,200])
 def test_competing_sells_share_budget(cap):
-    bars,rules=market();bars[2]=replace(bars[2],volume=cap)
+    bars,rules=market();bars[2]=replace(bars[2],volume=cap,open_volume=cap)
     def signal(b,s):
         if b==bars[0]:return [OrderIntent(b.symbol,'BUY',200)]
         if b==bars[1]:return [OrderIntent(b.symbol,'SELL',100,D('9.80'))]*2

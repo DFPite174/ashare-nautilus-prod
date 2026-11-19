@@ -93,7 +93,8 @@ def digest(value):
 def build_manifest(instruments, bars, rules, actions, sessions, fee, signal, *, initial_cash,
                    participation_rate, slippage_bps, strategy_id, strategy_params, data_snapshot_id,
                    _input_sha256=None,_data_delivery='full',_order_tape_sha256=None,
-                   _native_order_submit_rate=None):
+                   _native_order_submit_rate=None, frozen_orders=None,
+                   execution_mode='synthetic_l2', cash_exhaustion_policy='reject'):
     root = Path(__file__).resolve().parents[1]
     try:
         commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, stderr=subprocess.DEVNULL, text=True).strip()
@@ -127,7 +128,8 @@ def build_manifest(instruments, bars, rules, actions, sessions, fee, signal, *, 
         asset_policies[group]=policy
     config = dict(initial_cash=str(initial_cash), participation_rate=str(participation_rate),
                   slippage_bps=str(slippage_bps), execution_policy='same-open-sell-before-buy-v1',
-                  execution_model='bar-synthetic-l2-v1',
+                  execution_model=execution_mode or 'synthetic_l2',
+                  cash_exhaustion_policy=cash_exhaustion_policy or 'reject',
                   data_delivery=_data_delivery,
                   fee_schedules=schedules,symbol_fee_policy=symbol_policies)
     if _native_order_submit_rate is not None:
@@ -139,6 +141,8 @@ def build_manifest(instruments, bars, rules, actions, sessions, fee, signal, *, 
         environment={'python':platform.python_version(), 'platform':platform.platform(),
                      **{name:importlib.metadata.version(name) for name in ('nautilus_trader','pydantic','numpy','pandas','pyarrow')}},
         config=canonical(config))
+    if frozen_orders is not None:
+        manifest['frozen_orders_sha256'] = digest(canonical(frozen_orders))
     if _order_tape_sha256 is not None:
         manifest['order_tape_sha256']=_order_tape_sha256
         manifest['decision_contract']='daily-close-frozen-tape-v1'

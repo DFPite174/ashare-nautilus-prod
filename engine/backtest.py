@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Optional, Dict, Tuple, Set, List, Any
 from zoneinfo import ZoneInfo
 
 from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
@@ -57,6 +58,7 @@ class BacktestBar:
     low: Decimal
     close: Decimal
     volume: int
+    open_volume: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,9 @@ class BacktestResult:
     execution_model: str = "bar-synthetic-l2-v1: bar-derived synthetic L2 with native NT matching; next-bar-open IOC; DAY limits: open price improvement, resting limits at limit; O-H-L-C path; shared bar volume cap; inactive-session pending intents rejected; no observed L2/queue/auction reconstruction"
     schema_version: int = 2
     run_statistics: dict = field(default_factory=dict)
+    fee_model: Optional[Any] = None
+    unfilled_capital_amount: Decimal = Decimal('0.0')
+    residual_holding_symbols: dict = field(default_factory=dict)
 
     def to_dict(self):
         from dataclasses import asdict
@@ -100,7 +105,7 @@ class BacktestResult:
         return convert(asdict(self))
 
     def frictional_summary(self) -> dict:
-        from engine.fee_model import get_ashare_rates_for_date
+        from engine.fee_model import get_ashare_rates_for_date, get_cb_rates_for_date
         from zoneinfo import ZoneInfo
         sh_tz = ZoneInfo("Asia/Shanghai")
 
@@ -113,7 +118,11 @@ class BacktestResult:
         proportional_commission = Decimal('0.0')
         min_commission_drag = Decimal('0.0')
 
+        order_raw_comm: Dict[str, Decimal] = {}
+        order_charged_comm: Dict[str, Decimal] = {}
+
         for f in self.fills:
+            sym = f.get('symbol', '')
             qty = Decimal(str(f['quantity']))
             px = Decimal(str(f['price']))
             val = qty * px
@@ -128,23 +137,40 @@ class BacktestResult:
                 dt = datetime.fromtimestamp(time_ns / 1e9, sh_tz)
                 trade_date = str(dt.date())
 
-            rates = get_ashare_rates_for_date(trade_date)
-            t_fee = (val * rates['transfer_fee_rate']).quantize(Decimal('0.0001'))
+            if self.fee_model is not None:
+                rates = self.fee_model.rates_for(sym, trade_date)
+            else:
+                rates = get_ashare_rates_for_date(trade_date)
+
+            t_rate = Decimal(str(rates['transfer_fee_rate']))
+            s_rate = Decimal(str(rates['stamp_duty_rate']))
+            c_rate = Decimal(str(rates['commission_rate']))
+            min_c = Decimal(str(rates['min_commission']))
+
+            t_fee = (val * t_rate).quantize(Decimal('0.0001'))
             transfer_fee += t_fee
 
             s_duty = Decimal('0.0')
             if 'SELL' in side:
                 sell_turnover += val
-                s_duty = (val * rates['stamp_duty_rate']).quantize(Decimal('0.0001'))
+                s_duty = (val * s_rate).quantize(Decimal('0.0001'))
                 stamp_duty += s_duty
             else:
                 buy_turnover += val
 
-            raw_comm = val * rates['commission_rate']
-            proportional_commission += raw_comm
-            actual_comm = fee - (t_fee.quantize(Decimal('0.01')) + s_duty.quantize(Decimal('0.01')))
-            if actual_comm > raw_comm:
-                min_commission_drag += (actual_comm - raw_comm)
+            order_key = f.get('order_id', f.get('id', sym))
+            raw_c = val * c_rate
+            prev_raw = order_raw_comm.get(order_key, Decimal('0.0'))
+            prev_charged = order_charged_comm.get(order_key, Decimal('0.0'))
+            new_raw = prev_raw + raw_c
+            order_raw_comm[order_key] = new_raw
+            total_comm_due = max(new_raw, min_c)
+            inc_comm = total_comm_due - prev_charged
+            order_charged_comm[order_key] = prev_charged + inc_comm
+
+            proportional_commission += raw_c
+            drag = max(Decimal('0.0'), inc_comm - raw_c)
+            min_commission_drag += drag
 
         rejections_by_reason = {}
         for r in self.rejections:
@@ -172,10 +198,15 @@ class BacktestResult:
 
     def attribution_report(self) -> str:
         s = self.frictional_summary()
-        initial_cash = Decimal(str(self.manifest.get('initial_cash', 0))) if self.manifest else Decimal('0.0')
+        raw_initial_cash = (self.manifest or {}).get("config", {}).get("initial_cash")
+        if raw_initial_cash is None and self.manifest:
+            raw_initial_cash = self.manifest.get("initial_cash")
+        initial_cash = Decimal(str(raw_initial_cash)) if raw_initial_cash is not None else None
         final_equity = Decimal(str(self.daily_nav[-1]['total_equity'])) if self.daily_nav else self.ledger_cash
-        total_pnl = final_equity - initial_cash if initial_cash > 0 else Decimal('0.0')
+        total_pnl = final_equity - initial_cash if initial_cash is not None else Decimal('0.0')
         rejections_str = "".join(f"     - {k:<24}: {v:>8d}\n" for k, v in s['rejections_by_reason'].items()) if s['rejections_by_reason'] else "     - None\n"
+        initial_cash_str = f"{initial_cash:>15,.2f} CNY" if initial_cash is not None else "        UNKNOWN"
+        pnl_str = f"{total_pnl:>15,.2f} CNY" if initial_cash is not None else "        UNKNOWN"
         return (
             "================================================================================\n"
             "                 ASHARE-NAUTILUS MICROSTRUCTURE FRICTION REPORT                 \n"
@@ -185,8 +216,8 @@ class BacktestResult:
             f"   - Sell Turnover        : {s['sell_turnover']:>15,.2f} CNY\n"
             "--------------------------------------------------------------------------------\n"
             f" Total Statutory Frictions: {s['total_fee']:>15,.2f} CNY ({s['friction_bps']} bps)\n"
-            f"   * Pure Commission (万三): {s['proportional_commission']:>15,.2f} CNY\n"
-            f"   * 5 CNY Min Drag (保底): {s['min_commission_drag']:>15,.2f} CNY\n"
+            f"   * Pure Commission      : {s['proportional_commission']:>15,.2f} CNY\n"
+            f"   * Min Commission Drag  : {s['min_commission_drag']:>15,.2f} CNY\n"
             f"   * Stamp Duty (印花税)  : {s['stamp_duty']:>15,.2f} CNY\n"
             f"   * Transfer Fee (过户费): {s['transfer_fees']:>15,.2f} CNY\n"
             "--------------------------------------------------------------------------------\n"
@@ -196,9 +227,9 @@ class BacktestResult:
             + rejections_str +
             "--------------------------------------------------------------------------------\n"
             f" Account Equity           :\n"
-            f"   * Initial Cash         : {initial_cash:>15,.2f} CNY\n"
+            f"   * Initial Cash         : {initial_cash_str}\n"
             f"   * Final Equity         : {final_equity:>15,.2f} CNY\n"
-            f"   * Net Realized PnL     : {total_pnl:>15,.2f} CNY\n"
+            f"   * Net Realized PnL     : {pnl_str}\n"
             "================================================================================"
         )
 
@@ -298,13 +329,22 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
                             f"(prev_close={prev_close}, rule_prev_close={rule_prev}, diff={diff}) but NO corporate action "
                             f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
                         )
-                if master[b.symbol].asset_class.value == 'EQUITY' and r.get('limit_state') == 'BOUNDED' and values[0] < prev_close * D('0.68'):
-                    if not has_action:
-                        raise ValueError(
-                            f"CRITICAL_DATA_DEFECT: Symbol {b.symbol} on {end_day} exhibits ex-rights price gap "
-                            f"(prev_close={prev_close}, curr_open={values[0]}) but NO corporate action "
-                            f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
-                        )
+                else:
+                    if master[b.symbol].asset_class.value == 'EQUITY' and r.get('limit_state') == 'BOUNDED':
+                        sym_clean = b.symbol.split('.')[0]
+                        if sym_clean.startswith(('60', '00')):
+                            statutory_bound = D('0.88')
+                        elif sym_clean.startswith(('30', '688')):
+                            statutory_bound = D('0.78')
+                        else:
+                            statutory_bound = D('0.68')
+                        if values[0] < prev_close * statutory_bound:
+                            if not has_action:
+                                raise ValueError(
+                                    f"CRITICAL_DATA_DEFECT: Symbol {b.symbol} on {end_day} exhibits ex-rights price gap "
+                                    f"(prev_close={prev_close}, curr_open={values[0]}) but NO corporate action "
+                                    f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
+                                )
         last_close_record[b.symbol] = (values[3], end_day)
     for (symbol,day),r in rules.items():
         if day in session_set and symbol in master and r['trade_status']=='OPEN' and (symbol,day) not in actual:
@@ -745,7 +785,10 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         strategy_id=strategy_id,strategy_params=strategy_params,data_snapshot_id=data_snapshot_id,
         _input_sha256=_prepared.input_sha256 if _prepared is not None else None,_data_delivery=data_mode,
         _order_tape_sha256=_tape.sha256 if _tape is not None else None,
-        _native_order_submit_rate=NATIVE_ORDER_SUBMIT_RATE)
+        _native_order_submit_rate=NATIVE_ORDER_SUBMIT_RATE,
+        frozen_orders=frozen_orders,
+        execution_mode=execution_mode,
+        cash_exhaustion_policy=cash_exhaustion_policy)
     liquidity=BarLiquidity(slippage_bps)
     # Complete research history lives in our immutable callback snapshots.
     eng=BacktestEngine(config=BacktestEngineConfig(
@@ -773,6 +816,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             if data:eng.add_data(data)
             eng.run(start=at(sessions[0],0),end=at(sessions[-1],15))
         else:
+            day_prev_volumes = {}
             for day in sessions:
                 active={i.symbol for eligible,i in strategy.pending if eligible<=nanos(at(day,9,30))} if data_mode in {'sparse','orders'} else None
                 day_bars=strategy.by_day[day]
@@ -781,7 +825,9 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                     day_bars=[b for b in day_bars if b.symbol in selected]
                     strategy.current_bars={b.symbol:b for b in day_bars}
                     statistics['native_market_bars']=statistics.get('native_market_bars',0)+sum(b.volume>0 and rules[b.symbol,day]['trade_status']=='OPEN' for b in day_bars)
-                data=build_events(day_bars,rules,native,participation_rate,liquidity,bar_types,active,mode=execution_mode)
+                data=build_events(day_bars,rules,native,participation_rate,liquidity,bar_types,active,mode=execution_mode,prev_volumes=day_prev_volumes)
+                for b in day_bars:
+                    if b.volume > 0: day_prev_volumes[b.symbol] = b.volume
                 statistics['market_events']+=len(data)
                 statistics['peak_batch_events']=max(statistics['peak_batch_events'],len(data)+1)
                 if data:eng.add_data(data)
@@ -789,7 +835,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                 statistics['boundary_events']+=1
                 eng.run(start=at(sessions[0],0),end=at(sessions[-1],15)+timedelta(microseconds=1),streaming=True)
                 eng.clear_data()
-                liquidity.events.clear();liquidity.remaining.clear();liquidity.active.clear();liquidity.intrabar.clear()
+                liquidity.events.clear();liquidity.remaining.clear();liquidity.active.clear();liquidity.intrabar.clear();liquidity.consumed.clear()
             eng.end()
         if len(strategy.nav)!=len(sessions):raise RuntimeError("Missing daily reconciliation")
         if _prepared is not None and _prepared.unresolved_entitlements:
@@ -797,11 +843,42 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             verify_zero_entitlements(strategy.nav, _prepared.unresolved_entitlements)
         native_cash=D(str(round(eng.portfolio.account(SIM).balance_total(CNY).as_double(), 2)))
         orders=[{'id':str(o.client_order_id),'status':o.status.name,'quantity':str(o.quantity),'filled_quantity':str(o.filled_qty),
+                 **({'price': str(o.price)} if getattr(o, 'price', None) is not None else {}),
                  **({'intent_id':strategy.order_intent_ids[str(o.client_order_id)]} if str(o.client_order_id) in strategy.order_intent_ids else {})} for o in eng.cache.orders()]
         pending=[{'symbol':i.symbol,'side':i.side,'quantity':i.quantity,'reason':'END_OF_DATA',
                   **({'intent_id':i.intent_id} if i.intent_id is not None else {}),
                   **({'earliest_execution':i.earliest_execution.isoformat()} if i.earliest_execution else {})} for _,i in strategy.pending]
-        result=BacktestResult(native_cash,strategy.ledger.cash,{s:strategy.ledger.positions.get(s,D(0)) for s in master},strategy.fills,strategy.rejections,strategy.nav,list(cash_module.journal),orders,pending,manifest)
+        unfilled_cap = Decimal('0.0')
+        for r in strategy.rejections:
+            rej_qty = Decimal(str(r.get('quantity', 0))) if 'quantity' in r else Decimal('0.0')
+            rej_px = Decimal(str(r.get('price', 0))) if 'price' in r else Decimal('0.0')
+            if rej_qty > 0 and rej_px > 0:
+                unfilled_cap += rej_qty * rej_px
+        for o in orders:
+            if o['status'] in {'CANCELED', 'EXPIRED'}:
+                qty_req = Decimal(str(o.get('quantity', 0)))
+                qty_fill = Decimal(str(o.get('filled_quantity', 0)))
+                unfilled_qty = qty_req - qty_fill
+                if unfilled_qty > 0:
+                    px_val = Decimal(str(o.get('price', 0))) if 'price' in o else Decimal('0.0')
+                    unfilled_cap += unfilled_qty * px_val
+
+        residual_holdings = {
+            s: str(int(strategy.ledger.positions[s])) if strategy.ledger.positions[s] == int(strategy.ledger.positions[s]) else str(strategy.ledger.positions[s])
+            for s in master if strategy.ledger.positions.get(s, D(0)) != 0
+        }
+
+        exec_model_desc = (
+            "bar-synthetic-l2-v1: bar-derived synthetic L2 with native NT matching; next-bar-open IOC; DAY limits: open price improvement, resting limits at limit; O-H-L-C path; shared bar volume cap; inactive-session pending intents rejected; no observed L2/queue/auction reconstruction"
+            if execution_mode == "synthetic_l2" else str(execution_mode)
+        )
+        result=BacktestResult(native_cash,strategy.ledger.cash,{s:strategy.ledger.positions.get(s,D(0)) for s in master},strategy.fills,strategy.rejections,strategy.nav,list(cash_module.journal),orders,pending,manifest,
+                              execution_model=exec_model_desc,
+                              schema_version=2,
+                              run_statistics=statistics,
+                              fee_model=fee,
+                              unfilled_capital_amount=unfilled_cap.quantize(D('0.01')),
+                              residual_holding_symbols=residual_holdings)
         result.run_statistics=statistics
         if _tape is not None:statistics.update(input_bars=len(bars),scheduled_intents=len(_tape.entries))
         return result
@@ -813,7 +890,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         finally:eng.dispose()
 
 
-def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject'):
+def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject', frozen_orders=None):
     """Validate raw inputs and run one isolated shared-cash portfolio."""
     if actions is not None and not corporate_actions:
         corporate_actions = actions
@@ -821,7 +898,7 @@ def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(),
         initial_cash=initial_cash,participation_rate=participation_rate,trading_days=trading_days,
         fee_model=fee_model,portfolio_signal=portfolio_signal,slippage_bps=slippage_bps,
         strategy_id=strategy_id,strategy_params=strategy_params,data_snapshot_id=data_snapshot_id,data_mode=data_mode,
-        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy)
+        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,frozen_orders=frozen_orders)
 
 
 def run_prepared_backtest(prepared, signal=None, **run_options):

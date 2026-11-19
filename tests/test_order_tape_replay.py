@@ -41,7 +41,7 @@ def test_frozen_tape_matches_callback_account_and_fills(kind):
     symbols=('600000.SH','600001.SH')
     bars,rules=market(symbols)
     if kind=='partial':
-        bars=[replace(b,volume=150) if b.end.date().day==7 else b for b in bars]
+        bars=[replace(b,volume=150,open_volume=150) if b.end.date().day==7 else b for b in bars]
     if kind=='halt':
         for b in bars:
             if b.end.date().day==7:rules[b.symbol,b.end.date()]['trade_status']='SUSPENDED'

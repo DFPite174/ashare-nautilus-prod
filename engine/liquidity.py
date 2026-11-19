@@ -23,6 +23,7 @@ class BarLiquidity(FillModel):
     def __init__(self, slippage_bps=0):
         super().__init__()
         self.events={};self.active={};self.remaining={};self.intrabar={}
+        self.consumed={}
         self.affordable=None
         self.slippage_bps=Decimal(str(slippage_bps))
 
@@ -41,11 +42,16 @@ class BarLiquidity(FillModel):
         key,cap,intrabar=self.events[(iid,data.ts_init)]
         self.active[iid]=key
         self.intrabar[iid]=intrabar
-        self.remaining.setdefault(key,cap)
+        if key not in self.remaining:
+            self.remaining[key]=cap
+        elif intrabar and key in self.consumed:
+            self.remaining[key]=max(0, cap - self.consumed[key])
 
     def consume(self,iid,quantity):
         key=self.active[str(iid)]
-        self.remaining[key]-=int(Decimal(str(quantity)))
+        qty=int(Decimal(str(quantity)))
+        self.consumed[key]=self.consumed.get(key, 0) + qty
+        self.remaining[key]-=qty
         if self.remaining[key]<0:raise RuntimeError('Native fills exceeded bar participation budget')
 
     def get_orderbook_for_fill_simulation(self,instrument,order,best_bid,best_ask):
@@ -71,4 +77,5 @@ class LiquidityModule(SimulationModule):
     def pre_process(self,data):self.model.begin(data)
     def process(self,ts_now):pass
     def log_diagnostics(self,logger):pass
-    def reset(self):self.model.active.clear();self.model.remaining.clear();self.model.intrabar.clear()
+    def reset(self):
+        self.model.active.clear();self.model.remaining.clear();self.model.intrabar.clear();self.model.consumed.clear()

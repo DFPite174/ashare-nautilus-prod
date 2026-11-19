@@ -18,7 +18,7 @@ def test_target_uses_only_closed_history_and_equal_allocation():
 
 def test_next_rebalance_uses_actual_partial_position_and_cash():
     bars, rules = fixture(days=8, symbol='600000.SH')
-    bars[1] = replace(bars[1], volume=50)
+    bars[1] = replace(bars[1], volume=50, open_volume=50)
     data = LakeInputs([Instrument(symbol='600000.SH', exchange=Venue.SSE)],
                       bars, rules, [b.end.date() for b in bars], [], {'snapshot_id': 'fixture'})
     result, decisions = run_candidate(data, False, D(10000), 1, 0)

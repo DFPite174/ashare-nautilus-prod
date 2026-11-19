@@ -141,25 +141,32 @@ class AShareFeeModel(FeeModel):
         self._order_raw_commission: Dict[str, Decimal] = {}
         self._order_commission_charged: Dict[str, Decimal] = {}
 
-    def _is_cb_order(self, order: Order) -> bool:
+    def _is_cb_symbol(self, symbol: str) -> bool:
         if getattr(self, "is_cb_model", False):
             return True
-        iid_str = str(order.instrument_id) if hasattr(order, "instrument_id") else ""
-        raw_sym = iid_str.rsplit(".", 1)[0]
-        sym = raw_sym.split("-")[0] if "-" in raw_sym else raw_sym.split('.')[0]
         cb_set = getattr(self, "cb_symbols", set())
-        return iid_str in cb_set or raw_sym in cb_set or sym in cb_set
+        raw_sym = symbol.rsplit(".", 1)[0] if symbol.endswith(".ASHARE") or symbol.endswith(".SIM") else symbol
+        bare_sym = raw_sym.split("-")[0].split(".")[0]
+        return symbol in cb_set or raw_sym in cb_set or bare_sym in cb_set
+
+    def _is_cb_order(self, order: Order) -> bool:
+        iid_str = str(order.instrument_id) if hasattr(order, "instrument_id") else ""
+        return self._is_cb_symbol(iid_str)
+
+    def get_effective_rates(self, symbol: str, trade_date: Optional[str]) -> Dict[str, Decimal]:
+        """统一有效费率单一真理源 (Single Source of Truth)"""
+        is_cb = self._is_cb_symbol(symbol)
+        matched = get_cb_rates_for_date(trade_date) if is_cb else get_ashare_rates_for_date(trade_date)
+        return {
+            "commission_rate": self._custom_comm_rate if self._custom_comm_rate is not None else matched["commission_rate"],
+            "min_commission": self._custom_min_comm if self._custom_min_comm is not None else matched["min_commission"],
+            "stamp_duty_rate": self._custom_stamp_rate if self._explicit_stamp_duty else matched["stamp_duty_rate"],
+            "transfer_fee_rate": self._custom_transfer_rate if self._explicit_transfer_fee else matched["transfer_fee_rate"],
+        }
 
     def rates_for(self, symbol: str, trade_date: str) -> Dict[str, Decimal]:
         """Export configuration, independently of native order accumulators."""
-        matched = get_cb_rates_for_date(trade_date) if getattr(self, 'is_cb_model', False) or symbol in self.cb_symbols else get_ashare_rates_for_date(trade_date)
-        overrides = dict(commission_rate=self._custom_comm_rate,min_commission=self._custom_min_comm,
-                         stamp_duty_rate=self._custom_stamp_rate,transfer_fee_rate=self._custom_transfer_rate)
-        result = {key:custom if custom is not None else matched[key] for key,custom in overrides.items()}
-        # Match the legacy native API: baseline tax overrides retain historical dates.
-        for key, baseline in (('stamp_duty_rate', Decimal('.0005')), ('transfer_fee_rate', Decimal('.00001'))):
-            if result[key] == baseline and not getattr(self,'is_cb_model',False): result[key] = matched[key]
-        return result
+        return self.get_effective_rates(symbol, trade_date)
 
     def set_scope(self, scope_id: str) -> None:
         """设置运行命名空间并重置缓存"""
@@ -189,17 +196,9 @@ class AShareFeeModel(FeeModel):
             dt = datetime.fromtimestamp(order.ts_init / 1e9, tz=SHANGHAI_TZ)
             order_date = dt.strftime("%Y-%m-%d")
 
-        if self._is_cb_order(order):
-            matched = get_cb_rates_for_date(order_date)
-        else:
-            matched = get_ashare_rates_for_date(order_date)
-
-        comm_rate = self._custom_comm_rate if self._custom_comm_rate is not None else matched["commission_rate"]
-        min_comm = self._custom_min_comm if self._custom_min_comm is not None else matched["min_commission"]
-        stamp_rate = self._custom_stamp_rate if self._explicit_stamp_duty else matched["stamp_duty_rate"]
-        transfer_rate = self._custom_transfer_rate if self._explicit_transfer_fee else matched["transfer_fee_rate"]
-
-        return comm_rate, min_comm, stamp_rate, transfer_rate
+        iid_str = str(order.instrument_id) if hasattr(order, "instrument_id") else ""
+        rates = self.get_effective_rates(iid_str, order_date)
+        return rates["commission_rate"], rates["min_commission"], rates["stamp_duty_rate"], rates["transfer_fee_rate"]
 
     def get_commission(
         self,
@@ -284,15 +283,5 @@ class ConvertibleBondFeeModel(AShareFeeModel):
         )
 
     def _resolve_rates(self, order: Order) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
-        order_date: Optional[str] = self.current_trade_date
-        if order_date is None and hasattr(order, "ts_init") and order.ts_init > 0:
-            dt = datetime.fromtimestamp(order.ts_init / 1e9, tz=SHANGHAI_TZ)
-            order_date = dt.strftime("%Y-%m-%d")
-
-        matched = get_cb_rates_for_date(order_date)
-        comm_rate = self._custom_comm_rate if self._custom_comm_rate is not None else matched["commission_rate"]
-        min_comm = self._custom_min_comm if self._custom_min_comm is not None else matched["min_commission"]
-        stamp_rate = self._custom_stamp_rate if self._explicit_stamp_duty else matched["stamp_duty_rate"]
-        transfer_rate = self._custom_transfer_rate if self._explicit_transfer_fee else matched["transfer_fee_rate"]
-        return comm_rate, min_comm, stamp_rate, transfer_rate
+        return super()._resolve_rates(order)
 

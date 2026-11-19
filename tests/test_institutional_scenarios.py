@@ -8,6 +8,7 @@ Formally verifies:
 """
 from datetime import datetime, date, timedelta
 from decimal import Decimal as D
+from typing import Optional
 from zoneinfo import ZoneInfo
 import pytest
 
@@ -22,7 +23,7 @@ def dt_daily(day_str: str, hour: int = 9, minute: int = 30) -> datetime:
     return datetime(d.year, d.month, d.day, hour, minute, tzinfo=TZ)
 
 
-def make_daily_bar(symbol: str, day_str: str, o: float, h: float, l: float, c: float, v: int) -> BacktestBar:
+def make_daily_bar(symbol: str, day_str: str, o: float, h: float, l: float, c: float, v: int, open_volume: Optional[int] = None) -> BacktestBar:
     start = dt_daily(day_str, 9, 30)
     end = dt_daily(day_str, 15, 0)
     return BacktestBar(
@@ -34,6 +35,7 @@ def make_daily_bar(symbol: str, day_str: str, o: float, h: float, l: float, c: f
         low=D(str(l)).quantize(D("0.01")),
         close=D(str(c)).quantize(D("0.01")),
         volume=v,
+        open_volume=open_volume,
     )
 
 
@@ -264,7 +266,7 @@ def test_scenario_3_extreme_microstructure_and_risk_collars():
                     bars.append(make_daily_bar(sym, day_s, 99.0, 99.0, 99.0, 99.0, 5000))
                     rules[(sym, d)] = make_daily_rule(sym, day_s, up=121.0, down=99.0)
                 elif d == date(2025, 7, 8):
-                    bars.append(make_daily_bar(sym, day_s, 100.0, 101.0, 99.0, 100.0, 1000))
+                    bars.append(make_daily_bar(sym, day_s, 100.0, 101.0, 99.0, 100.0, 1000, open_volume=1000))
                     rules[(sym, d)] = make_daily_rule(sym, day_s, up=108.9, down=89.1)
                 elif d == date(2025, 7, 9):
                     bars.append(make_daily_bar(sym, day_s, 100.0, 101.0, 99.0, 100.0, 50000))
