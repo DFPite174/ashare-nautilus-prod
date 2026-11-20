@@ -110,7 +110,7 @@ def test_zero_volume_orders_with_late_gate_preserve_rejection_order():
     reference=run_prepared_backtest(prepared,portfolio_signal=lambda closed,state:[e.intent for e in entries if e.decision_time==closed[0].end])
     result=run_order_tape(prepared,prepare_order_tape(prepared,entries))
     assert compare_backtests(reference,result)['equal_within_compared_fields']
-    assert len(result.rejections)==2
+    assert len(result.orders)==2 and all(o['status']=='CANCELED' for o in result.orders)
 
 
 def test_last_session_tape_without_market_bar_remains_pending():

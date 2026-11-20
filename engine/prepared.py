@@ -44,6 +44,8 @@ class PreparedBacktest:
     bars_by_day: Mapping
     daily_only: bool
     unresolved_entitlements: tuple
+    corporate_action_gate_policy: str
+    anomalies: tuple
 
     def __new__(cls, *args, **kwargs):
         raise TypeError("Use prepare_backtest() to create validated inputs")
@@ -54,10 +56,13 @@ class PreparedBacktest:
             raise ValueError("Market validator changed; prepare inputs again")
 
 
-def prepare_backtest(instruments, bars, rules, *, corporate_actions=(), trading_days=None, unresolved_entitlements=()):
+def prepare_backtest(instruments, bars, rules, *, corporate_actions=(), trading_days=None, unresolved_entitlements=(), corporate_action_gate_policy='strict'):
     """Detach inputs, validate market coverage once, and cache their content hash."""
     from engine.backtest import BacktestBar, _validate, TZ, at
     from contracts import Instrument, ConvertibleBondInstrument, CorporateAction
+
+    if corporate_action_gate_policy not in {"strict", "warn"}:
+        raise ValueError(f"Invalid corporate_action_gate_policy: {corporate_action_gate_policy}")
 
     instruments = tuple(instruments)
     if any(type(i) not in (Instrument, ConvertibleBondInstrument) for i in instruments):
@@ -76,7 +81,8 @@ def prepare_backtest(instruments, bars, rules, *, corporate_actions=(), trading_
     frozen_rules = freeze_rules(rules,_freeze)
     if trading_days is not None:
         trading_days = tuple(_freeze(day) for day in trading_days)
-    master, sessions = _validate(instruments, bars, frozen_rules, actions, Decimal(1), 1, trading_days)
+    anomalies = []
+    master, sessions = _validate(instruments, bars, frozen_rules, actions, Decimal(1), 1, trading_days, corporate_action_gate_policy=corporate_action_gate_policy, anomalies=anomalies)
     sessions = tuple(sessions)
     by_day=defaultdict(list);daily_only=True
     daily_bounds={day:(at(day,9,30),at(day,15)) for day in sessions}
@@ -103,6 +109,8 @@ def prepare_backtest(instruments, bars, rules, *, corporate_actions=(), trading_
                            rules=frozen_rules, master=MappingProxyType(master),
                            input_sha256=input_sha256, validation_version=_validation_version(_validate),
                            bars_by_day=bars_by_day,daily_only=daily_only,
-                           unresolved_entitlements=unresolved_entitlements).items():
+                           unresolved_entitlements=unresolved_entitlements,
+                           corporate_action_gate_policy=corporate_action_gate_policy,
+                           anomalies=tuple(anomalies)).items():
         object.__setattr__(prepared, key, value)
     return prepared

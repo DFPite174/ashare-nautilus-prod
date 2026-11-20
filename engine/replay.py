@@ -27,7 +27,8 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,
     data=[];rate=Decimal(str(rate))
     history_vol = dict(prev_volumes) if prev_volumes is not None else {}
     for b in sorted(bars,key=lambda item:(item.start,item.symbol)):
-        if b.volume==0 or rules[(b.symbol,b.end.astimezone(TZ).date())]['trade_status']!='OPEN':
+        rule = rules[(b.symbol,b.end.astimezone(TZ).date())]
+        if rule['trade_status'] != 'OPEN':
             if b.volume > 0: history_vol[b.symbol] = b.volume
             continue
         inst=native[b.symbol];start,end=nanos(b.start),nanos(b.end)
@@ -37,6 +38,8 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,
             open_vol = getattr(b, 'open_volume', None)
             if open_vol is not None:
                 open_cap = int(Decimal(str(open_vol)) * rate)
+            elif b.volume == 0:
+                open_cap = 0
             elif b.symbol in history_vol:
                 open_cap = int(Decimal(str(history_vol[b.symbol])) * rate)
             else:
@@ -44,7 +47,11 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,
             if b.volume > 0:
                 history_vol[b.symbol] = b.volume
         else:
-            open_cap = day_cap
+            open_vol = getattr(b, 'open_volume', None)
+            if open_vol is not None:
+                open_cap = int(Decimal(str(open_vol)) * rate)
+            else:
+                open_cap = day_cap
         precision=inst.price_precision;px_fmt=f'.{precision}f'
         detailed=active_symbols is None or b.symbol in active_symbols
         if detailed:
