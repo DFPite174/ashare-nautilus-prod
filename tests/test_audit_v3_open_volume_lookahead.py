@@ -116,3 +116,22 @@ def test_open_decision_identical_regardless_of_afternoon_closing_volume():
     # In run A (50k vol), it filled; in run B (0 vol), it canceled due to 0 liquidity
     assert len(res_a.fills) == 1 and res_a.fills[0]["quantity"] == "100"
     assert len(res_b.fills) == 0 and res_b.orders[0]["status"] == "CANCELED"
+
+def test_minute_order_does_not_use_unclosed_volume():
+    from dataclasses import replace
+    from datetime import timedelta
+
+    day = date(2025, 1, 2)
+    opening = make_day_bar("600519.SH", day, 100, 102, 99, 100, 50000)
+    first = replace(opening, end=opening.start + timedelta(minutes=1))
+    second = replace(opening, start=first.end, end=first.end + timedelta(minutes=1))
+    rules = {("600519.SH", day): dict(
+        trade_status="OPEN", limit_state="BOUNDED", down_limit=90, up_limit=110,
+        buy_min=100, buy_step=100, sell_min=100, sell_step=100, max_order=1000000)}
+
+    def signal(bar, state):
+        return [OrderIntent(bar.symbol, "BUY", 100)] if bar == first else []
+
+    for volume in (5000, 50000):
+        result = run_backtest([INST], [first, replace(second, volume=volume)], rules, signal)
+        assert [fill["quantity"] for fill in result.fills] == ["100"]

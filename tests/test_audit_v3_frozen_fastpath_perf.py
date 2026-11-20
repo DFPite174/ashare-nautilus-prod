@@ -129,3 +129,27 @@ def test_frozen_orders_fallback_under_auto_trim_and_minute_bars():
     assert res.fills[0]["symbol"] == "600519.SH"
     assert res.positions["600519.SH"] == D("100.0")
     assert res.manifest["config"]["cash_exhaustion_policy"] == "auto_trim"
+
+def test_frozen_after_blocked_session_preserves_execution():
+    instruments, bars, rules, dates = make_market(3)
+    rules["600519.SH", dates[1]]["trade_status"] = "DAY_BLOCKED"
+    orders = [FrozenOrder(symbol="600519.SH", trade_date=dates[2], side="BUY", quantity=100)]
+    full = run_frozen_orders_backtest(instruments, bars, rules, orders, data_mode="full")
+    fast = run_frozen_orders_backtest(instruments, bars, rules, iter(orders))
+    assert len(full.fills) == 1
+    assert fast.fills == full.fills
+    assert fast.daily_nav == full.daily_nav
+
+
+def test_fastpath_propagates_execution_error(monkeypatch):
+    import pytest
+    import engine.tape_replay as replay
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("execution failed")
+
+    monkeypatch.setattr(replay, "run_order_tape", fail)
+    instruments, bars, rules, dates = make_market(3)
+    orders = [FrozenOrder(symbol="600519.SH", trade_date=dates[1], side="BUY", quantity=100)]
+    with pytest.raises(RuntimeError, match="execution failed"):
+        run_frozen_orders_backtest(instruments, bars, rules, orders)

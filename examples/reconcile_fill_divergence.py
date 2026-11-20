@@ -5,14 +5,8 @@ Module: examples/reconcile_fill_divergence.py
 Scientific microstructure reconciliation tool comparing execution traces between
 engines (e.g. ashare-nautilus-prod, RQAlpha, and ashare-nautilus-backtest-engine).
 
-Pinpoints:
-1. Exact First Divergence timestamp and order/intent ID.
-2. Divergence category:
-   - PARTICIPATION_CAP: Capacity constraint difference (e.g. 10% daily volume vs 10% T-1 open proxy).
-   - LOT_ROUNDING_FEE: Rounding or fee drag difference.
-   - PRICE_BAND_LIMIT: Price collar / limit-up / limit-down gate differences.
-   - TIMING_OFFSET: Execution timing offset (e.g. 9:30 open IOC vs intraday or bar close).
-3. Contextual account state at the moment of first divergence.
+Compares already aligned fill streams. Reports observable differences;
+causal attribution requires order and market evidence.
 """
 
 from decimal import Decimal as D
@@ -59,6 +53,14 @@ class FirstFillDivergenceReconciler:
             fee_a = D(str(fa.get('fee', fa.get('commission', 0))))
             fee_b = D(str(fb.get('fee', fb.get('commission', 0))))
 
+            for field in ("intent_id", "time", "date"):
+                if fa.get(field) != fb.get(field):
+                    return {
+                        'divergence_found': True, 'index': i,
+                        'category': field.upper() + '_DIVERGENCE',
+                        'detail': f"{field} differs at fill #{i}",
+                        'fill_a': fa, 'fill_b': fb,
+                    }
             # Divergence checks
             if code_a != code_b or side_a != side_b:
                 return {
@@ -74,27 +76,27 @@ class FirstFillDivergenceReconciler:
                 return {
                     'divergence_found': True,
                     'index': i,
-                    'category': 'CAPACITY_PARTICIPATION_DIVERGENCE',
+                    'category': 'QUANTITY_DIVERGENCE',
                     'detail': f"Quantity mismatch on {code_a} at fill #{i}: {self.name_a} filled {qty_a}, {self.name_b} filled {qty_b}",
                     'fill_a': fa,
                     'fill_b': fb,
                 }
 
-            if abs(px_a - px_b) > D('0.01'):
+            if px_a != px_b:
                 return {
                     'divergence_found': True,
                     'index': i,
-                    'category': 'PRICE_IMPROVEMENT_DIVERGENCE',
+                    'category': 'PRICE_DIVERGENCE',
                     'detail': f"Fill price mismatch on {code_a} at fill #{i}: {self.name_a} filled @ {px_a}, {self.name_b} filled @ {px_b}",
                     'fill_a': fa,
                     'fill_b': fb,
                 }
 
-            if abs(fee_a - fee_b) > D('0.05'):
+            if fee_a != fee_b:
                 return {
                     'divergence_found': True,
                     'index': i,
-                    'category': 'STATUTORY_FEE_DIVERGENCE',
+                    'category': 'FEE_DIVERGENCE',
                     'detail': f"Fee calculation discrepancy on {code_a} at fill #{i}: {self.name_a} charged {fee_a}, {self.name_b} charged {fee_b}",
                     'fill_a': fa,
                     'fill_b': fb,
@@ -138,7 +140,7 @@ def reconcile_benchmark_divergences(summary_file: str) -> Dict[str, Any]:
             e2 = engine_names[j]
             fills_1 = engines[e1].get('fills', [])
             fills_2 = engines[e2].get('fills', [])
-            if fills_1 and fills_2:
+            if isinstance(fills_1, list) and isinstance(fills_2, list) and (fills_1 or fills_2):
                 rec = FirstFillDivergenceReconciler(e1, fills_1, e2, fills_2)
                 pair_key = f"{e1}__vs__{e2}"
                 report['pairs'][pair_key] = rec.find_first_divergence()

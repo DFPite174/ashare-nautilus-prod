@@ -54,7 +54,7 @@ class _TapeStrategy(_ResearchStrategy):
                 self._mark_price(bar.symbol,Decimal(str(bar.close)),bar.end)
         super()._close_day(event)
         for bar in self.by_day[day]:
-            if bar.volume>0:self.history[bar.symbol][:]=[bar]
+            if bar.volume>0 and self.rules[bar.symbol,day]['trade_status']=='OPEN':self.history[bar.symbol][:]=[bar]
         self._queue_intents([entry.intent for entry in self.tape.by_day.get(day,())],at(day,15))
 
 

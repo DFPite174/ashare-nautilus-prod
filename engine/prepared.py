@@ -111,6 +111,6 @@ def prepare_backtest(instruments, bars, rules, *, corporate_actions=(), trading_
                            bars_by_day=bars_by_day,daily_only=daily_only,
                            unresolved_entitlements=unresolved_entitlements,
                            corporate_action_gate_policy=corporate_action_gate_policy,
-                           anomalies=tuple(anomalies)).items():
+                           anomalies=tuple(_freeze(row) for row in anomalies)).items():
         object.__setattr__(prepared, key, value)
     return prepared

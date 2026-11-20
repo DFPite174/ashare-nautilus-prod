@@ -107,3 +107,16 @@ def test_run_backtest_enum_validations():
     # Invalid cash_exhaustion_policy
     with pytest.raises(ValueError, match="Invalid cash_exhaustion_policy"):
         run_backtest([INST], bars, rules, lambda b, s: [], corporate_action_gate_policy='warn', cash_exhaustion_policy='foo')
+
+def test_order_tape_reports_prepared_warn_policy():
+    from engine import prepare_order_tape, run_order_tape
+
+    bars, rules = make_suspected_gap_market()
+    with pytest.warns(UserWarning, match="ex-rights price gap"):
+        prepared = prepare_backtest([INST], bars, rules, corporate_action_gate_policy="warn")
+    tape = prepare_order_tape(prepared, [])
+    result = run_order_tape(prepared, tape)
+    assert result.manifest["config"]["corporate_action_gate_policy"] == "warn"
+    assert len(result.manifest["data_anomalies"]) == 1
+    with pytest.raises(ValueError, match="conflicts"):
+        run_order_tape(prepared, tape, corporate_action_gate_policy="strict")

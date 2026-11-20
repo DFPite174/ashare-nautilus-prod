@@ -407,8 +407,6 @@ class _ResearchStrategy(Strategy):
         self.trimmed_intents = []
         self.failed_sell_symbols = set()
         self.uncompleted_sell_leaves = defaultdict(Decimal)
-        self.explicit_zero_targets = set()
-        self.latest_target_symbols = None
         self.order_sides = {}
         self.liquidity.affordable=self._affordable_quantity
         t0_symbols={s for s in master if self._is_cb(s)}
@@ -461,7 +459,11 @@ class _ResearchStrategy(Strategy):
                     if not px.is_finite() or px <= 0 or px % self.master[sym].tick_size:
                         raise ValueError("Invalid limit price or price tick in frozen order")
                     limit_px = px
-                self.frozen_orders_by_date[t_date].append(OrderIntent(symbol=sym, side=side_str, quantity=qty, limit_price=limit_px))
+                if t_date not in self.sessions:
+                    raise ValueError(f"Frozen order date is outside trading sessions: {t_date}")
+                intent_id = fo.get('intent_id') if isinstance(fo, dict) else getattr(fo, 'intent_id', None)
+                self.frozen_orders_by_date[t_date].append(OrderIntent(symbol=sym, side=side_str, quantity=qty,
+                    limit_price=limit_px, intent_id=intent_id))
 
     def _is_cb(self, symbol: str) -> bool:
         inst = self.master.get(symbol)
@@ -506,8 +508,7 @@ class _ResearchStrategy(Strategy):
             self.rejected_intents = []
         self.rejected_intents.append((intent, price, timestamp))
         if intent.side.upper() == 'SELL':
-            self.failed_sell_symbols.add(intent.symbol)
-            self.uncompleted_sell_leaves[intent.symbol] += Decimal(str(intent.quantity))
+            self._record_unfilled_sell(intent.symbol, D(intent.quantity))
 
     def _mark_price(self,symbol,price,timestamp):
         self._market_value+=self._marked_quantities.get(symbol,D(0))*(price-self.last_close.get(symbol,D(0)))
@@ -651,7 +652,7 @@ class _ResearchStrategy(Strategy):
     def _submit_open(self,tick,phase):
         if not self.pending:return
         symbol=self.by_id[str(tick.instrument_id)];day=datetime.fromtimestamp(tick.ts_event/1e9,TZ).date()
-        previous_volume=next((b.volume for b in reversed(self.history[symbol]) if b.volume>0),0)
+        previous_volume=next((b.volume for b in reversed(self.history[symbol]) if b.volume>0 and self.rules[(symbol,b.end.astimezone(TZ).date())]['trade_status']=='OPEN'),0)
         budget_key=(symbol,tick.ts_event)
         if not hasattr(self,'submission_budget'):self.submission_budget={}
         available=self.submission_budget.setdefault(budget_key,int(D(previous_volume)*D(str(self.rate))))
@@ -736,6 +737,12 @@ class _ResearchStrategy(Strategy):
         self.fee_values[key]=before+qty*px
         self.ledger.apply_fill(Fill(fill_id=str(e.trade_id),symbol=symbol,side=LedgerSide(e.order_side.name),quantity=qty,price=px,fee=fee,timestamp=datetime.fromtimestamp(e.ts_event/1e9,TZ)),day)
         self._sync_account_symbol(symbol)
+        if e.order_side.name == 'SELL' and symbol in self.uncompleted_sell_leaves:
+            self.uncompleted_sell_leaves[symbol] = max(D(0), self.uncompleted_sell_leaves[symbol] - qty)
+            if not self.uncompleted_sell_leaves[symbol]:
+                self.failed_sell_symbols.discard(symbol)
+        elif e.order_side.name == 'BUY':
+            self.failed_sell_symbols.discard(symbol)
         if key in self.buy_reservations:
             reserve=self.buy_reservations[key];reserve['quantity']-=qty
             if reserve['quantity']==0:self.buy_reservations.pop(key)
@@ -744,19 +751,18 @@ class _ResearchStrategy(Strategy):
         self.fills.append({'symbol':symbol,'side':e.order_side.name,'quantity':str(qty),'price':str(px),'fee':str(fee),'time':e.ts_event,'order_id':key})
         if key in self.order_intent_ids:self.fills[-1]['intent_id']=self.order_intent_ids[key]
 
+    def _record_unfilled_sell(self, symbol, leaves):
+        if leaves > 0:
+            self.uncompleted_sell_leaves[symbol] += leaves
+            position = self.ledger.positions.get(symbol, D(0))
+            if position > 0 and leaves >= position:
+                self.failed_sell_symbols.add(symbol)
+
     def _record_failed_sell_leaves(self, e, sym):
         if self.order_sides.get(str(e.client_order_id)) == 'SELL':
-            self.failed_sell_symbols.add(sym)
-            try:
-                order = self.cache.order(e.client_order_id)
-                if order is not None:
-                    qty = Decimal(str(order.quantity))
-                    filled = Decimal(str(order.filled_qty))
-                    leaves = qty - filled
-                    if leaves > 0:
-                        self.uncompleted_sell_leaves[sym] += leaves
-            except Exception:
-                pass
+            order = self.cache.order(e.client_order_id)
+            if order is not None:
+                self._record_unfilled_sell(sym, D(str(order.quantity)) - D(str(order.filled_qty)))
 
     def on_order_canceled(self,e):
         self.gateway.on_order_canceled(str(e.client_order_id));self.buy_reservations.pop(str(e.client_order_id),None)
@@ -837,13 +843,17 @@ class _ResearchStrategy(Strategy):
         self.nav.append(row);self.closed.add(day)
 
 
-def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy='strict', _prepared=None, _tape=None):
+def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy=None, _prepared=None, _tape=None):
     """Run one isolated, shared-cash portfolio. Rules keyed by (symbol, local date)."""
     VALID_GATE_POLICIES = {"strict", "warn"}
     VALID_EXEC_MODES = {"synthetic_l2", "auction_open"}
     VALID_DATA_MODES = {"full", "session", "sparse", "orders"}
     VALID_CASH_POLICIES = {"reject", "auto_trim"}
 
+    if corporate_action_gate_policy is None:
+        corporate_action_gate_policy = _prepared.corporate_action_gate_policy if _prepared is not None else 'strict'
+    elif _prepared is not None and corporate_action_gate_policy != _prepared.corporate_action_gate_policy:
+        raise ValueError("Requested corporate_action_gate_policy conflicts with prepared policy")
     if corporate_action_gate_policy not in VALID_GATE_POLICIES:
         raise ValueError(f"Invalid corporate_action_gate_policy: {corporate_action_gate_policy}")
     if execution_mode not in VALID_EXEC_MODES:
@@ -865,7 +875,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             raise ValueError('Invalid cash or participation_rate')
         master,sessions=_prepared.master,_prepared.sessions
         actions=_prepared.actions
-        anomalies=list(getattr(_prepared, 'anomalies', ()))
+        anomalies=[dict(row) for row in _prepared.anomalies]
     if frozen_orders is None and _tape is None and (signal is None)==(portfolio_signal is None):
         raise ValueError('Provide exactly one of signal or portfolio_signal')
     slippage_bps=D(str(slippage_bps))
@@ -988,25 +998,12 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             if leaves > 0:
                 uncompleted_sells[s] = str(int(leaves) if leaves == int(leaves) else leaves)
 
-        residual_holdings = {}
-        latest_targets = getattr(strategy, 'latest_target_symbols', None)
-        explicit_zero_targets = getattr(strategy, 'explicit_zero_targets', set())
-        failed_sells = getattr(strategy, 'failed_sell_symbols', set())
-        for s in master:
-            pos = strategy.ledger.positions.get(s, D(0))
-            if pos > 0:
-                is_residual = False
-                if latest_targets is not None and s not in latest_targets:
-                    is_residual = True
-                elif s in explicit_zero_targets:
-                    is_residual = True
-                elif s in failed_sells:
-                    leaves = getattr(strategy, 'uncompleted_sell_leaves', {}).get(s, D(0))
-                    # Only if leaves >= pos (attempted full liquidation of holding)
-                    if leaves >= pos:
-                        is_residual = True
-                if is_residual:
-                    residual_holdings[s] = str(int(pos) if pos == int(pos) else pos)
+        residual_holdings = {
+            s: str(pos.normalize()) if pos % 1 else str(int(pos))
+            for s, pos in strategy.ledger.positions.items()
+            if s in strategy.failed_sell_symbols and pos > 0
+            and strategy.uncompleted_sell_leaves[s] >= pos
+        }
 
         exec_model_desc = (
             "bar-synthetic-l2-v1: bar-derived synthetic L2 with native NT matching; next-bar-open IOC; DAY limits: open price improvement, resting limits at limit; O-H-L-C path; shared bar volume cap; inactive-session pending intents rejected; no observed L2/queue/auction reconstruction"
@@ -1074,6 +1071,8 @@ def run_frozen_orders_backtest(
     from engine.intents import OrderIntent
 
     _prep = kwargs.pop('_prepared', None)
+    if frozen_orders is not None:
+        frozen_orders = tuple(frozen_orders)
     can_fastpath = (
         data_mode == 'orders'
         and execution_mode in {'synthetic_l2', 'auction_open'}
@@ -1082,61 +1081,64 @@ def run_frozen_orders_backtest(
     )
 
     if can_fastpath:
-        try:
-            if _prep is not None:
-                prepared = _prep
-            else:
-                prepared = prepare_backtest(
-                    instruments, bars, rules,
-                    corporate_actions=corporate_actions,
-                    trading_days=trading_days,
-                    corporate_action_gate_policy=corporate_action_gate_policy
+        if _prep is not None:
+            prepared = _prep
+        else:
+            prepared = prepare_backtest(
+                instruments, bars, rules,
+                corporate_actions=corporate_actions,
+                trading_days=trading_days,
+                corporate_action_gate_policy=corporate_action_gate_policy
+            )
+
+        if prepared.daily_only and len(prepared.sessions) > 0:
+            session_indices = {day: idx for idx, day in enumerate(prepared.sessions)}
+            timed_intents = []
+            fastpath_valid = True
+
+            for fo in frozen_orders:
+                sym = getattr(fo, 'symbol', None) or (fo['symbol'] if isinstance(fo, dict) else None)
+                t_date = getattr(fo, 'trade_date', None) or (fo['trade_date'] if isinstance(fo, dict) else None)
+                if isinstance(t_date, str):
+                    t_date = date.fromisoformat(t_date)
+                side_val = getattr(fo, 'side', None) or (fo['side'] if isinstance(fo, dict) else None)
+                side_str = str(side_val).upper().replace('ORDERSIDE.', '')
+                qty = getattr(fo, 'quantity', None) if hasattr(fo, 'quantity') else fo['quantity']
+                limit_px = getattr(fo, 'limit_price', None) if hasattr(fo, 'limit_price') else (fo.get('limit_price') if isinstance(fo, dict) else None)
+                intent_id = getattr(fo, 'intent_id', None) if hasattr(fo, 'intent_id') else (fo.get('intent_id') if isinstance(fo, dict) else None)
+
+                idx = session_indices.get(t_date)
+                if idx is None or idx == 0:
+                    fastpath_valid = False
+                    break
+
+                prev_session = prepared.sessions[idx - 1]
+                previous_rule = prepared.rules.get((sym, prev_session), {})
+                if previous_rule.get("trade_status") != "OPEN" or not any(
+                    bar.symbol == sym and bar.volume > 0 for bar in prepared.bars_by_day[prev_session]
+                ):
+                    fastpath_valid = False
+                    break
+                dec_time = at(prev_session, 15)
+                oi = OrderIntent(
+                    symbol=sym, side=side_str, quantity=qty,
+                    limit_price=Decimal(str(limit_px)) if limit_px is not None else None,
+                    intent_id=intent_id
                 )
+                timed_intents.append(TimedOrderIntent(decision_time=dec_time, intent=oi))
 
-            if prepared.daily_only and len(prepared.sessions) > 0:
-                session_indices = {day: idx for idx, day in enumerate(prepared.sessions)}
-                timed_intents = []
-                fastpath_valid = True
-
-                for fo in frozen_orders:
-                    sym = getattr(fo, 'symbol', None) or (fo['symbol'] if isinstance(fo, dict) else None)
-                    t_date = getattr(fo, 'trade_date', None) or (fo['trade_date'] if isinstance(fo, dict) else None)
-                    if isinstance(t_date, str):
-                        t_date = date.fromisoformat(t_date)
-                    side_val = getattr(fo, 'side', None) or (fo['side'] if isinstance(fo, dict) else None)
-                    side_str = str(side_val).upper().replace('ORDERSIDE.', '')
-                    qty = getattr(fo, 'quantity', None) if hasattr(fo, 'quantity') else fo['quantity']
-                    limit_px = getattr(fo, 'limit_price', None) if hasattr(fo, 'limit_price') else (fo.get('limit_price') if isinstance(fo, dict) else None)
-                    intent_id = getattr(fo, 'intent_id', None) if hasattr(fo, 'intent_id') else (fo.get('intent_id') if isinstance(fo, dict) else None)
-
-                    idx = session_indices.get(t_date)
-                    if idx is None or idx == 0:
-                        fastpath_valid = False
-                        break
-
-                    prev_session = prepared.sessions[idx - 1]
-                    dec_time = at(prev_session, 15)
-                    oi = OrderIntent(
-                        symbol=sym, side=side_str, quantity=qty,
-                        limit_price=Decimal(str(limit_px)) if limit_px is not None else None,
-                        intent_id=intent_id
-                    )
-                    timed_intents.append(TimedOrderIntent(decision_time=dec_time, intent=oi))
-
-                if fastpath_valid and timed_intents:
-                    tape = prepare_order_tape(prepared, timed_intents)
-                    return run_order_tape(
-                        prepared, tape,
-                        initial_cash=initial_cash,
-                        participation_rate=participation_rate,
-                        fee_model=fee_model,
-                        execution_mode=execution_mode,
-                        cash_exhaustion_policy=cash_exhaustion_policy,
-                        corporate_action_gate_policy=corporate_action_gate_policy,
-                        **kwargs
-                    )
-        except Exception:
-            pass
+            if fastpath_valid and timed_intents:
+                tape = prepare_order_tape(prepared, timed_intents)
+                return run_order_tape(
+                    prepared, tape,
+                    initial_cash=initial_cash,
+                    participation_rate=participation_rate,
+                    fee_model=fee_model,
+                    execution_mode=execution_mode,
+                    cash_exhaustion_policy=cash_exhaustion_policy,
+                    corporate_action_gate_policy=corporate_action_gate_policy,
+                    **kwargs
+                )
 
     return _run_backtest(
         instruments, bars, rules, signal=None, corporate_actions=corporate_actions,

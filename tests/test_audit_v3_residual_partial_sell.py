@@ -112,3 +112,24 @@ def test_full_liquidation_failure_reports_both_residual_and_uncompleted():
     assert res.positions["600519.SH"] == D("200.0")
     assert res.uncompleted_sell_orders.get("600519.SH") == "200"
     assert res.residual_holding_symbols.get("600519.SH") == "200"
+
+def test_later_sell_retires_failed_reduction():
+    days = [date(2025, 1, n) for n in (2, 3, 6, 7)]
+    bars = [make_day_bar(INST.symbol, day, 100, 101, 99, 100, 50000) for day in days]
+    rules = {(INST.symbol, day): dict(
+        trade_status='DAY_BLOCKED' if day == days[2] else 'OPEN',
+        limit_state='BOUNDED', down_limit=90, up_limit=110,
+        buy_min=100, buy_step=100, sell_min=100, sell_step=100, max_order=1000000,
+    ) for day in days}
+
+    def signal(bar, state):
+        if bar.end.date() == days[0]:
+            return [OrderIntent(bar.symbol, 'BUY', 200)]
+        if bar.end.date() in days[1:3]:
+            return [OrderIntent(bar.symbol, 'SELL', 100)]
+        return []
+
+    result = run_backtest([INST], bars, rules, signal)
+    assert result.positions[INST.symbol] == D(100)
+    assert result.uncompleted_sell_orders == {}
+    assert result.residual_holding_symbols == {}

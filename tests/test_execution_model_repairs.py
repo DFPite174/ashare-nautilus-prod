@@ -76,7 +76,7 @@ def test_open_and_intrabar_orders_share_one_budget():
 
 def test_partial_day_order_can_fill_on_adjacent_minute_without_budget_leak():
     bars,rules=market(days=1);first=replace(bars[0],end=bars[0].start+timedelta(minutes=1))
-    minutes=[first]+[replace(first,start=first.start+timedelta(minutes=i),end=first.end+timedelta(minutes=i),volume=50) for i in [1,2]]
+    minutes=[first]+[replace(first,start=first.start+timedelta(minutes=i),end=first.end+timedelta(minutes=i),volume=50,open_volume=50) for i in [1,2]]
     def signal(b,s):return [OrderIntent(b.symbol,'BUY',100,D('10.20'))] if b==first else []
     r=run_backtest([INST],minutes,rules,signal,participation_rate=1)
     assert [D(f['quantity']) for f in r.fills]==[D(50),D(50)]

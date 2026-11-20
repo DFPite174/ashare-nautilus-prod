@@ -100,7 +100,7 @@ def test_earliest_inside_bar_does_not_use_its_intrabar_path():
 def test_partial_day_order_exposes_reserved_cash_in_minute_snapshot():
     first,rules=market(days=1,minute=True)
     bar=replace(first[0],volume=20000)
-    bars=[bar,replace(bar,start=bar.start+timedelta(minutes=1),end=bar.end+timedelta(minutes=1),volume=15000),
+    bars=[bar,replace(bar,start=bar.start+timedelta(minutes=1),end=bar.end+timedelta(minutes=1),volume=15000,open_volume=15000),
           replace(bar,start=bar.start+timedelta(minutes=2),end=bar.end+timedelta(minutes=2))]
     snapshots=[]
     def signal(b,state):

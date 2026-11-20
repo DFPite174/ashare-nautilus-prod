@@ -29,29 +29,19 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,
     for b in sorted(bars,key=lambda item:(item.start,item.symbol)):
         rule = rules[(b.symbol,b.end.astimezone(TZ).date())]
         if rule['trade_status'] != 'OPEN':
-            if b.volume > 0: history_vol[b.symbol] = b.volume
             continue
         inst=native[b.symbol];start,end=nanos(b.start),nanos(b.end)
         day_cap=int(Decimal(b.volume)*rate);iid=str(inst.id);key=(b.symbol,end)
         daily=b.start.astimezone(TZ)==at(b.start.astimezone(TZ).date(),9,30) and b.end.astimezone(TZ)==at(b.end.astimezone(TZ).date(),15)
-        if daily:
-            open_vol = getattr(b, 'open_volume', None)
-            if open_vol is not None:
-                open_cap = int(Decimal(str(open_vol)) * rate)
-            elif b.volume == 0:
-                open_cap = 0
-            elif b.symbol in history_vol:
-                open_cap = int(Decimal(str(history_vol[b.symbol])) * rate)
-            else:
-                open_cap = 0
-            if b.volume > 0:
-                history_vol[b.symbol] = b.volume
+        if b.open_volume is not None:
+            open_cap = int(Decimal(b.open_volume) * rate)
+        elif b.volume == 0:
+            # A verified zero-trade bar has no executable price.
+            open_cap = 0
         else:
-            open_vol = getattr(b, 'open_volume', None)
-            if open_vol is not None:
-                open_cap = int(Decimal(str(open_vol)) * rate)
-            else:
-                open_cap = day_cap
+            open_cap = int(Decimal(history_vol.get(b.symbol, 0)) * rate)
+        if b.volume > 0:
+            history_vol[b.symbol] = b.volume
         precision=inst.price_precision;px_fmt=f'.{precision}f'
         detailed=active_symbols is None or b.symbol in active_symbols
         if detailed:
