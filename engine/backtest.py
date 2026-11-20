@@ -807,10 +807,13 @@ class _ResearchStrategy(Strategy):
         self.gateway.on_session_close()
         for symbol in closing_symbols:self._sync_account_symbol(symbol)
         for b in self.by_day[day]:
-            if (b.volume==0 or self.rules[(b.symbol,day)]['trade_status']!='OPEN') and b not in self.history[b.symbol]:
+            history = self.history[b.symbol]
+            if history and history[-1].end >= b.end:
+                continue  # Validated bars do not overlap and callbacks append chronologically.
+            if b.volume==0 or self.rules[(b.symbol,day)]['trade_status']!='OPEN':
                 self._inactive_bar(b)
-            elif b not in self.history[b.symbol]:
-                self.history[b.symbol].append(b)
+            else:
+                history.append(b)
         remaining=[]
         for eligible,intent in self.pending:
             status=self.rules.get((intent.symbol,day),{}).get('trade_status','DAY_BLOCKED')
