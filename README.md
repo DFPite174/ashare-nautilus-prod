@@ -200,6 +200,7 @@ python examples/validate_tushare_lake.py --root "C:\path\to\Tushare_DB" --benchm
 
 ```
 推荐采用   百股普通 A 股日频／周频离线执行与账户复核
+独立试用   IF 单合约日线回放与逐日结算
 专项验收   分钟策略、可转债、更大股票池与更高订单密度
 其他工具   全市场因子快筛、真实逐笔盘口与券商路由
 ```
@@ -216,6 +217,7 @@ python examples/validate_tushare_lake.py --root "C:\path\to\Tushare_DB" --benchm
 - [冻结订单回放协议 (docs/order-tape.md)](docs/order-tape.md)
 - [执行模型与合成深度 (docs/execution-model.md)](docs/execution-model.md)
 - [回放语义与验证 (docs/replay-integrity.md)](docs/replay-integrity.md)
+- [沪深 300 股指期货回放（IF）](docs/index-futures.md)
 
 ---
 
