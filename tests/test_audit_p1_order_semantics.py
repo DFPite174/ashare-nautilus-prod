@@ -75,4 +75,5 @@ def test_order_semantics_auction_open_vs_synthetic_l2():
     assert res_l2.fills[0]["price"] == "101.00"
     assert res_l2.fills[0]["quantity"] == "100"
     assert res_l2.unfilled_capital_amount == D("0.00")
-    assert res_l2.residual_holding_symbols == {"600519.SH": "100"}
+    assert res_l2.positions["600519.SH"] == D("100.0")
+    assert res_l2.residual_holding_symbols == {}

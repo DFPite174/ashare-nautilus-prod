@@ -94,7 +94,8 @@ def build_manifest(instruments, bars, rules, actions, sessions, fee, signal, *, 
                    participation_rate, slippage_bps, strategy_id, strategy_params, data_snapshot_id,
                    _input_sha256=None,_data_delivery='full',_order_tape_sha256=None,
                    _native_order_submit_rate=None, frozen_orders=None,
-                   execution_mode='synthetic_l2', cash_exhaustion_policy='reject'):
+                   execution_mode='synthetic_l2', cash_exhaustion_policy='reject',
+                   corporate_action_gate_policy='strict'):
     root = Path(__file__).resolve().parents[1]
     try:
         commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, stderr=subprocess.DEVNULL, text=True).strip()
@@ -130,6 +131,7 @@ def build_manifest(instruments, bars, rules, actions, sessions, fee, signal, *, 
                   slippage_bps=str(slippage_bps), execution_policy='same-open-sell-before-buy-v1',
                   execution_model=execution_mode or 'synthetic_l2',
                   cash_exhaustion_policy=cash_exhaustion_policy or 'reject',
+                  corporate_action_gate_policy=corporate_action_gate_policy or 'strict',
                   data_delivery=_data_delivery,
                   fee_schedules=schedules,symbol_fee_policy=symbol_policies)
     if _native_order_submit_rate is not None:

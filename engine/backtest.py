@@ -62,6 +62,17 @@ class BacktestBar:
 
 
 @dataclass(frozen=True)
+class TrimmedIntentRecord:
+    intent_id: Optional[str]
+    symbol: str
+    planned_quantity: int
+    submitted_quantity: int
+    trimmed_quantity: int
+    reference_price: Decimal
+    timestamp: int
+
+
+@dataclass(frozen=True)
 class ResearchState:
     cash: Decimal
     positions: object
@@ -94,6 +105,7 @@ class BacktestResult:
     fee_model: Optional[Any] = None
     unfilled_capital_amount: Decimal = Decimal('0.0')
     residual_holding_symbols: dict = field(default_factory=dict)
+    trimmed_intents: list = field(default_factory=list)
 
     def to_dict(self):
         from dataclasses import asdict
@@ -234,7 +246,7 @@ class BacktestResult:
         )
 
 
-def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_days):
+def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_days, corporate_action_gate_policy='strict', anomalies=None):
     if not initial_cash.is_finite() or initial_cash <= 0 or not 0 < rate <= 1:
         raise ValueError("Invalid cash or participation_rate")
     master = {i.symbol:i for i in instruments}
@@ -324,11 +336,18 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
                 if rule_prev is not None:
                     diff = abs(D(str(rule_prev)) - prev_close)
                     if diff > D('0.02') and not has_action:
-                        raise ValueError(
+                        msg = (
                             f"CRITICAL_DATA_DEFECT: Symbol {b.symbol} on {end_day} exhibits ex-rights price gap "
                             f"(prev_close={prev_close}, rule_prev_close={rule_prev}, diff={diff}) but NO corporate action "
-                            f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
+                            f"was supplied in 'actions'."
                         )
+                        if corporate_action_gate_policy == 'strict':
+                            raise ValueError(msg + " Aborting backtest to prevent False Confidence Illusion.")
+                        else:
+                            import warnings
+                            warnings.warn(msg + " Continuing under warn policy.", UserWarning)
+                            if anomalies is not None:
+                                anomalies.append({'symbol': b.symbol, 'date': str(end_day), 'type': 'confirmed_ex_rights_gap', 'diff': str(diff)})
                 else:
                     if master[b.symbol].asset_class.value == 'EQUITY' and r.get('limit_state') == 'BOUNDED':
                         sym_clean = b.symbol.split('.')[0]
@@ -340,11 +359,18 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
                             statutory_bound = D('0.68')
                         if values[0] < prev_close * statutory_bound:
                             if not has_action:
-                                raise ValueError(
+                                msg = (
                                     f"CRITICAL_DATA_DEFECT: Symbol {b.symbol} on {end_day} exhibits ex-rights price gap "
                                     f"(prev_close={prev_close}, curr_open={values[0]}) but NO corporate action "
-                                    f"was supplied in 'actions'. Aborting backtest to prevent False Confidence Illusion."
+                                    f"was supplied in 'actions'."
                                 )
+                                if corporate_action_gate_policy == 'strict':
+                                    raise ValueError(msg + " Aborting backtest to prevent False Confidence Illusion.")
+                                else:
+                                    import warnings
+                                    warnings.warn(msg + " Continuing under warn policy.", UserWarning)
+                                    if anomalies is not None:
+                                        anomalies.append({'symbol': b.symbol, 'date': str(end_day), 'type': 'suspected_ex_rights_gap', 'curr_open': str(values[0]), 'prev_close': str(prev_close)})
         last_close_record[b.symbol] = (values[3], end_day)
     for (symbol,day),r in rules.items():
         if day in session_set and symbol in master and r['trade_status']=='OPEN' and (symbol,day) not in actual:
@@ -370,6 +396,10 @@ class _ResearchStrategy(Strategy):
         self.liquidity=liquidity
         self.cash_exhaustion_policy=cash_exhaustion_policy
         self.buy_reservations={}
+        self.trimmed_intents = []
+        self.failed_sell_symbols = set()
+        self.latest_target_symbols = None
+        self.order_sides = {}
         self.liquidity.affordable=self._affordable_quantity
         t0_symbols={s for s in master if self._is_cb(s)}
         self.ledger=GoldenLedger(initial_cash,t0_symbols);self.gateway=AShareOrderGateway(t0_symbols)
@@ -456,10 +486,17 @@ class _ResearchStrategy(Strategy):
     def _native_quantity(self,symbol):
         return D(str(self.portfolio.net_position(self.native[symbol].id)))
 
-    def _reject_intent(self,intent,reason,timestamp):
+    def _reject_intent(self,intent,reason,timestamp,price=None):
+        if price is None:
+            price = intent.limit_price or self.last_close.get(intent.symbol, D(0))
         row={'symbol':intent.symbol,'reason':reason,'time':timestamp}
         if intent.intent_id is not None:row['intent_id']=intent.intent_id
         self.rejections.append(row)
+        if not hasattr(self, 'rejected_intents'):
+            self.rejected_intents = []
+        self.rejected_intents.append((intent, price, timestamp))
+        if intent.side.upper() == 'SELL':
+            self.failed_sell_symbols.add(intent.symbol)
 
     def _mark_price(self,symbol,price,timestamp):
         self._market_value+=self._marked_quantities.get(symbol,D(0))*(price-self.last_close.get(symbol,D(0)))
@@ -611,13 +648,13 @@ class _ResearchStrategy(Strategy):
         for created,intent in self.pending:
             if intent.symbol!=symbol or created>tick.ts_event or intent.side.upper()!=phase:
                 remaining.append((created,intent));continue
-            if intent.quantity>available:
-                self._reject_intent(intent,'PARTICIPATION_LIMIT',tick.ts_init);continue
             side=OrderSide.BUY if intent.side.upper()=='BUY' else OrderSide.SELL
-            # IOC at the observed open avoids NT market-order empty-book fallback.
-            args=dict(instrument_id=tick.instrument_id,order_side=side,quantity=Quantity.from_int(intent.quantity),time_in_force=TimeInForce.IOC if intent.limit_price is None else TimeInForce.DAY)
             price=tick.ask_price if side==OrderSide.BUY else tick.bid_price
             if intent.limit_price is None:price=self.liquidity.execution_price(price,side,self.native[symbol])
+            if intent.quantity>available:
+                self._reject_intent(intent,'PARTICIPATION_LIMIT',tick.ts_init,price=price);continue
+            # IOC at the observed open avoids NT market-order empty-book fallback.
+            args=dict(instrument_id=tick.instrument_id,order_side=side,quantity=Quantity.from_int(intent.quantity),time_in_force=TimeInForce.IOC if intent.limit_price is None else TimeInForce.DAY)
             order=self.order_factory.limit(**args,price=price if intent.limit_price is None else Price.from_str(format(intent.limit_price,f".{self.precisions[symbol]}f")))
             if side==OrderSide.BUY:
                 cost=D(str(order.price))*intent.quantity
@@ -631,22 +668,34 @@ class _ResearchStrategy(Strategy):
                         affordable_qty=self._calculate_affordable_lots(symbol,D(str(order.price)),intent.quantity,avail_cash,step,min_lot,day)
                         if affordable_qty>=min_lot:
                             from engine.intents import OrderIntent
+                            trimmed_qty = intent.quantity - affordable_qty
+                            if trimmed_qty > 0:
+                                self.trimmed_intents.append(TrimmedIntentRecord(
+                                    intent_id=intent.intent_id,
+                                    symbol=symbol,
+                                    planned_quantity=intent.quantity,
+                                    submitted_quantity=affordable_qty,
+                                    trimmed_quantity=trimmed_qty,
+                                    reference_price=D(str(order.price)),
+                                    timestamp=tick.ts_init
+                                ))
                             intent=OrderIntent(symbol=intent.symbol,side=intent.side,quantity=affordable_qty,limit_price=intent.limit_price,intent_id=intent.intent_id,earliest_execution=intent.earliest_execution)
                             args['quantity']=Quantity.from_int(intent.quantity)
                             order=self.order_factory.limit(**args,price=order.price)
                             cost=D(str(order.price))*intent.quantity
                             cost+=self._expected_fee('BUY',D(intent.quantity),D(str(order.price)),symbol=symbol,day=day)
                         else:
-                            self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init);continue
+                            self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init,price=order.price);continue
                     else:
-                        self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init);continue
+                        self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init,price=order.price);continue
+            self.order_sides[str(order.client_order_id)] = side.name
             r=self.gateway.validate_and_reserve(order,self.rules[(symbol,day)],{'close':tick.ask_price.as_double(),'volume':max(available,1),'execution_ts':tick.ts_init},tick.ask_price.as_double() if side==OrderSide.BUY else tick.bid_price.as_double())
             if r.is_valid:
                 self._sync_account_symbol(symbol)
                 if side==OrderSide.BUY:self.buy_reservations[str(order.client_order_id)]={'amount':cost,'quantity':D(intent.quantity),'price':D(str(order.price))}
                 if intent.intent_id is not None:self.order_intent_ids[str(order.client_order_id)]=intent.intent_id
                 self.submit_order(order);available-=intent.quantity
-            else:self._reject_intent(intent,r.rejection_reason,tick.ts_init)
+            else:self._reject_intent(intent,r.rejection_reason,tick.ts_init,price=order.price)
         self.pending=remaining
         self.submission_budget[budget_key]=available
 
@@ -686,20 +735,36 @@ class _ResearchStrategy(Strategy):
 
     def on_order_canceled(self,e):
         self.gateway.on_order_canceled(str(e.client_order_id));self.buy_reservations.pop(str(e.client_order_id),None)
-        self._sync_account_symbol(self.by_id[str(e.instrument_id)])
+        sym = self.by_id[str(e.instrument_id)]
+        self._sync_account_symbol(sym)
+        if self.order_sides.get(str(e.client_order_id)) == 'SELL':
+            self.failed_sell_symbols.add(sym)
     def on_order_expired(self,e):
         self.gateway.on_order_expired(str(e.client_order_id));self.buy_reservations.pop(str(e.client_order_id),None)
-        self._sync_account_symbol(self.by_id[str(e.instrument_id)])
+        sym = self.by_id[str(e.instrument_id)]
+        self._sync_account_symbol(sym)
+        if self.order_sides.get(str(e.client_order_id)) == 'SELL':
+            self.failed_sell_symbols.add(sym)
     def on_order_rejected(self,e):
         self.buy_reservations.pop(str(e.client_order_id),None)
-        self.gateway.on_order_rejected(str(e.client_order_id));self.rejections.append({'symbol':self.by_id[str(e.instrument_id)],'reason':str(e.reason),'time':e.ts_event})
-        self._sync_account_symbol(self.by_id[str(e.instrument_id)])
-        if str(e.client_order_id) in self.order_intent_ids:self.rejections[-1]['intent_id']=self.order_intent_ids[str(e.client_order_id)]
+        self.gateway.on_order_rejected(str(e.client_order_id))
+        sym = self.by_id[str(e.instrument_id)]
+        row = {'symbol':sym,'reason':str(e.reason),'time':e.ts_event}
+        if str(e.client_order_id) in self.order_intent_ids:row['intent_id']=self.order_intent_ids[str(e.client_order_id)]
+        self.rejections.append(row)
+        self._sync_account_symbol(sym)
+        if self.order_sides.get(str(e.client_order_id)) == 'SELL':
+            self.failed_sell_symbols.add(sym)
     def on_order_denied(self,e):
         self.buy_reservations.pop(str(e.client_order_id),None)
-        self.gateway.on_order_denied(str(e.client_order_id));self.rejections.append({'symbol':self.by_id[str(e.instrument_id)],'reason':str(e.reason),'time':e.ts_event})
-        self._sync_account_symbol(self.by_id[str(e.instrument_id)])
-        if str(e.client_order_id) in self.order_intent_ids:self.rejections[-1]['intent_id']=self.order_intent_ids[str(e.client_order_id)]
+        self.gateway.on_order_denied(str(e.client_order_id))
+        sym = self.by_id[str(e.instrument_id)]
+        row = {'symbol':sym,'reason':str(e.reason),'time':e.ts_event}
+        if str(e.client_order_id) in self.order_intent_ids:row['intent_id']=self.order_intent_ids[str(e.client_order_id)]
+        self.rejections.append(row)
+        self._sync_account_symbol(sym)
+        if self.order_sides.get(str(e.client_order_id)) == 'SELL':
+            self.failed_sell_symbols.add(sym)
 
     def _close_day(self,event):
         day=datetime.fromtimestamp(event.ts_event/1e9,TZ).date()
@@ -711,7 +776,10 @@ class _ResearchStrategy(Strategy):
         self.gateway.on_session_close()
         for symbol in closing_symbols:self._sync_account_symbol(symbol)
         for b in self.by_day[day]:
-            if (b.volume==0 or self.rules[(b.symbol,day)]['trade_status']!='OPEN') and b not in self.history[b.symbol]:self._inactive_bar(b)
+            if (b.volume==0 or self.rules[(b.symbol,day)]['trade_status']!='OPEN') and b not in self.history[b.symbol]:
+                self._inactive_bar(b)
+            elif b not in self.history[b.symbol]:
+                self.history[b.symbol].append(b)
         remaining=[]
         for eligible,intent in self.pending:
             status=self.rules.get((intent.symbol,day),{}).get('trade_status','DAY_BLOCKED')
@@ -745,14 +813,15 @@ class _ResearchStrategy(Strategy):
         self.nav.append(row);self.closed.add(day)
 
 
-def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', _prepared=None, _tape=None):
+def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy='strict', _prepared=None, _tape=None):
     """Run one isolated, shared-cash portfolio. Rules keyed by (symbol, local date)."""
     if actions is not None and not corporate_actions:
         corporate_actions = actions
     initial_cash=D(str(initial_cash))
+    anomalies = []
     if _prepared is None:
         instruments=list(instruments);bars=list(bars);actions=list(corporate_actions)
-        master,sessions=_validate(instruments,bars,rules,actions,initial_cash,participation_rate,trading_days)
+        master,sessions=_validate(instruments,bars,rules,actions,initial_cash,participation_rate,trading_days,corporate_action_gate_policy=corporate_action_gate_policy,anomalies=anomalies)
     else:
         if not initial_cash.is_finite() or initial_cash<=0 or not 0<participation_rate<=1:
             raise ValueError('Invalid cash or participation_rate')
@@ -763,7 +832,8 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
     slippage_bps=D(str(slippage_bps))
     if not slippage_bps.is_finite() or not 0<=slippage_bps<10000:raise ValueError('Invalid slippage_bps')
     if data_mode not in {'full','session','sparse','orders'}:raise ValueError('Invalid data_mode')
-    if data_mode=='orders' and (_prepared is None or _tape is None):raise ValueError('Use run_order_tape for orders delivery')
+    if data_mode=='orders' and (_prepared is None or _tape is None) and frozen_orders is None:
+        raise ValueError('Use run_order_tape or frozen_orders for orders delivery')
     if data_mode=='sparse' and any(b.start.astimezone(TZ)!=at(b.start.astimezone(TZ).date(),9,30) or b.end.astimezone(TZ)!=at(b.end.astimezone(TZ).date(),15) for b in bars):
         raise ValueError('Sparse delivery requires daily bars')
     cb_symbols = {s for s, i in master.items() if getattr(i, 'asset_class', None) == AssetClass.CONVERTIBLE_BOND or isinstance(i, ConvertibleBondInstrument)}
@@ -788,7 +858,10 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         _native_order_submit_rate=NATIVE_ORDER_SUBMIT_RATE,
         frozen_orders=frozen_orders,
         execution_mode=execution_mode,
-        cash_exhaustion_policy=cash_exhaustion_policy)
+        cash_exhaustion_policy=cash_exhaustion_policy,
+        corporate_action_gate_policy=corporate_action_gate_policy)
+    if anomalies:
+        manifest['data_anomalies'] = anomalies
     liquidity=BarLiquidity(slippage_bps)
     # Complete research history lives in our immutable callback snapshots.
     eng=BacktestEngine(config=BacktestEngineConfig(
@@ -816,26 +889,32 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             if data:eng.add_data(data)
             eng.run(start=at(sessions[0],0),end=at(sessions[-1],15))
         else:
-            day_prev_volumes = {}
+            universe_prev_volumes = {}
             for day in sessions:
-                active={i.symbol for eligible,i in strategy.pending if eligible<=nanos(at(day,9,30))} if data_mode in {'sparse','orders'} else None
-                day_bars=strategy.by_day[day]
-                if data_mode=='orders':
-                    selected=active|{s for s,q in strategy.ledger.positions.items() if q}
-                    day_bars=[b for b in day_bars if b.symbol in selected]
-                    strategy.current_bars={b.symbol:b for b in day_bars}
-                    statistics['native_market_bars']=statistics.get('native_market_bars',0)+sum(b.volume>0 and rules[b.symbol,day]['trade_status']=='OPEN' for b in day_bars)
-                data=build_events(day_bars,rules,native,participation_rate,liquidity,bar_types,active,mode=execution_mode,prev_volumes=day_prev_volumes)
-                for b in day_bars:
-                    if b.volume > 0: day_prev_volumes[b.symbol] = b.volume
-                statistics['market_events']+=len(data)
-                statistics['peak_batch_events']=max(statistics['peak_batch_events'],len(data)+1)
-                if data:eng.add_data(data)
-                eng.add_data([session_boundary(nanos(at(day,15))+1)],client_id=BOUNDARY_CLIENT)
-                statistics['boundary_events']+=1
-                eng.run(start=at(sessions[0],0),end=at(sessions[-1],15)+timedelta(microseconds=1),streaming=True)
+                raw_day_bars = strategy.by_day.get(day, ())
+                active = {i.symbol for eligible, i in strategy.pending if eligible <= nanos(at(day, 9, 30))} if data_mode in {'sparse', 'orders'} else None
+                if data_mode in {'sparse', 'orders'} and hasattr(strategy, 'frozen_orders_by_date') and day in strategy.frozen_orders_by_date:
+                    active = (active or set()) | {i.symbol for i in strategy.frozen_orders_by_date[day]}
+                if data_mode == 'orders':
+                    selected = active | {s for s, q in strategy.ledger.positions.items() if q}
+                    day_bars = [b for b in raw_day_bars if b.symbol in selected]
+                    strategy.current_bars = {b.symbol: b for b in day_bars}
+                    statistics['native_market_bars'] = statistics.get('native_market_bars', 0) + sum(b.volume > 0 and rules[b.symbol, day]['trade_status'] == 'OPEN' for b in day_bars)
+                else:
+                    day_bars = list(raw_day_bars)
+                prev_vol_snapshot = dict(universe_prev_volumes)
+                data = build_events(day_bars, rules, native, participation_rate, liquidity, bar_types, active, mode=execution_mode, prev_volumes=prev_vol_snapshot)
+                for b in raw_day_bars:
+                    if rules.get((b.symbol, day), {}).get('trade_status') == 'OPEN' and b.volume > 0:
+                        universe_prev_volumes[b.symbol] = b.volume
+                statistics['market_events'] += len(data)
+                statistics['peak_batch_events'] = max(statistics['peak_batch_events'], len(data) + 1)
+                if data: eng.add_data(data)
+                eng.add_data([session_boundary(nanos(at(day, 15)) + 1)], client_id=BOUNDARY_CLIENT)
+                statistics['boundary_events'] += 1
+                eng.run(start=at(sessions[0], 0), end=at(sessions[-1], 15) + timedelta(microseconds=1), streaming=True)
                 eng.clear_data()
-                liquidity.events.clear();liquidity.remaining.clear();liquidity.active.clear();liquidity.intrabar.clear();liquidity.consumed.clear()
+                liquidity.events.clear(); liquidity.remaining.clear(); liquidity.active.clear(); liquidity.intrabar.clear(); liquidity.consumed.clear()
             eng.end()
         if len(strategy.nav)!=len(sessions):raise RuntimeError("Missing daily reconciliation")
         if _prepared is not None and _prepared.unresolved_entitlements:
@@ -849,11 +928,11 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                   **({'intent_id':i.intent_id} if i.intent_id is not None else {}),
                   **({'earliest_execution':i.earliest_execution.isoformat()} if i.earliest_execution else {})} for _,i in strategy.pending]
         unfilled_cap = Decimal('0.0')
-        for r in strategy.rejections:
-            rej_qty = Decimal(str(r.get('quantity', 0))) if 'quantity' in r else Decimal('0.0')
-            rej_px = Decimal(str(r.get('price', 0))) if 'price' in r else Decimal('0.0')
-            if rej_qty > 0 and rej_px > 0:
-                unfilled_cap += rej_qty * rej_px
+        for intent, rej_px, _ in getattr(strategy, 'rejected_intents', []):
+            rej_qty = Decimal(str(intent.quantity))
+            rej_px_val = Decimal(str(rej_px))
+            if rej_qty > 0 and rej_px_val > 0:
+                unfilled_cap += rej_qty * rej_px_val
         for o in orders:
             if o['status'] in {'CANCELED', 'EXPIRED'}:
                 qty_req = Decimal(str(o.get('quantity', 0)))
@@ -862,11 +941,22 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                 if unfilled_qty > 0:
                     px_val = Decimal(str(o.get('price', 0))) if 'price' in o else Decimal('0.0')
                     unfilled_cap += unfilled_qty * px_val
+        for t in getattr(strategy, 'trimmed_intents', []):
+            unfilled_cap += Decimal(str(t.trimmed_quantity)) * t.reference_price
 
-        residual_holdings = {
-            s: str(int(strategy.ledger.positions[s])) if strategy.ledger.positions[s] == int(strategy.ledger.positions[s]) else str(strategy.ledger.positions[s])
-            for s in master if strategy.ledger.positions.get(s, D(0)) != 0
-        }
+        residual_holdings = {}
+        latest_targets = getattr(strategy, 'latest_target_symbols', None)
+        failed_sells = getattr(strategy, 'failed_sell_symbols', set())
+        for s in master:
+            pos = strategy.ledger.positions.get(s, D(0))
+            if pos > 0:
+                is_residual = False
+                if latest_targets is not None and s not in latest_targets:
+                    is_residual = True
+                elif s in failed_sells:
+                    is_residual = True
+                if is_residual:
+                    residual_holdings[s] = str(int(pos) if pos == int(pos) else pos)
 
         exec_model_desc = (
             "bar-synthetic-l2-v1: bar-derived synthetic L2 with native NT matching; next-bar-open IOC; DAY limits: open price improvement, resting limits at limit; O-H-L-C path; shared bar volume cap; inactive-session pending intents rejected; no observed L2/queue/auction reconstruction"
@@ -878,7 +968,8 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                               run_statistics=statistics,
                               fee_model=fee,
                               unfilled_capital_amount=unfilled_cap.quantize(D('0.01')),
-                              residual_holding_symbols=residual_holdings)
+                              residual_holding_symbols=residual_holdings,
+                              trimmed_intents=list(getattr(strategy, 'trimmed_intents', [])))
         result.run_statistics=statistics
         if _tape is not None:statistics.update(input_bars=len(bars),scheduled_intents=len(_tape.entries))
         return result
@@ -890,7 +981,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         finally:eng.dispose()
 
 
-def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject', frozen_orders=None):
+def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy='strict', frozen_orders=None):
     """Validate raw inputs and run one isolated shared-cash portfolio."""
     if actions is not None and not corporate_actions:
         corporate_actions = actions
@@ -898,7 +989,7 @@ def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(),
         initial_cash=initial_cash,participation_rate=participation_rate,trading_days=trading_days,
         fee_model=fee_model,portfolio_signal=portfolio_signal,slippage_bps=slippage_bps,
         strategy_id=strategy_id,strategy_params=strategy_params,data_snapshot_id=data_snapshot_id,data_mode=data_mode,
-        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,frozen_orders=frozen_orders)
+        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,corporate_action_gate_policy=corporate_action_gate_policy,frozen_orders=frozen_orders)
 
 
 def run_prepared_backtest(prepared, signal=None, **run_options):
@@ -913,8 +1004,8 @@ def run_prepared_backtest(prepared, signal=None, **run_options):
 def run_frozen_orders_backtest(
     instruments, bars, rules, frozen_orders, *,
     corporate_actions=(), actions=None, initial_cash=D(100000),
-    participation_rate=.01, trading_days=None, fee_model=None, data_mode='full',
-    execution_mode='synthetic_l2', cash_exhaustion_policy='reject', **kwargs
+    participation_rate=.01, trading_days=None, fee_model=None, data_mode='orders',
+    execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy='strict', **kwargs
 ) -> BacktestResult:
     """Run backtest directly executing frozen orders from upstream (e.g. VectorBT)."""
     if actions is not None and not corporate_actions:
@@ -923,6 +1014,7 @@ def run_frozen_orders_backtest(
         instruments, bars, rules, signal=None, corporate_actions=corporate_actions,
         initial_cash=initial_cash, participation_rate=participation_rate, trading_days=trading_days,
         fee_model=fee_model, data_mode=data_mode, frozen_orders=frozen_orders,
-        execution_mode=execution_mode, cash_exhaustion_policy=cash_exhaustion_policy, **kwargs
+        execution_mode=execution_mode, cash_exhaustion_policy=cash_exhaustion_policy,
+        corporate_action_gate_policy=corporate_action_gate_policy, **kwargs
     )
 

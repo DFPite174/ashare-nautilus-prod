@@ -40,7 +40,7 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,
             elif b.symbol in history_vol:
                 open_cap = int(Decimal(str(history_vol[b.symbol])) * rate)
             else:
-                open_cap = day_cap
+                open_cap = 0
             if b.volume > 0:
                 history_vol[b.symbol] = b.volume
         else:
