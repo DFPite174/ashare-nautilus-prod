@@ -14,9 +14,10 @@ def _no_signals(bar,state):
 
 
 class _TapeStrategy(_ResearchStrategy):
-    def __init__(self,prepared,tape,signal,initial_cash,rate,native,fee,cash_module,liquidity):
+    def __init__(self,prepared,tape,signal,initial_cash,rate,native,fee,cash_module,liquidity, *, frozen_orders=None, cash_exhaustion_policy="reject"):
         super().__init__((),prepared.rules,prepared.master,prepared.sessions,prepared.actions,
-                         signal,initial_cash,rate,native,fee,cash_module,liquidity)
+                         signal,initial_cash,rate,native,fee,cash_module,liquidity,
+                         frozen_orders=frozen_orders, cash_exhaustion_policy=cash_exhaustion_policy)
         self.by_day=prepared.bars_by_day
         self.tape=tape;self.current_bars={}
 

@@ -461,9 +461,10 @@ class _ResearchStrategy(Strategy):
                     limit_px = px
                 if t_date not in self.sessions:
                     raise ValueError(f"Frozen order date is outside trading sessions: {t_date}")
-                intent_id = fo.get('intent_id') if isinstance(fo, dict) else getattr(fo, 'intent_id', None)
-                self.frozen_orders_by_date[t_date].append(OrderIntent(symbol=sym, side=side_str, quantity=qty,
-                    limit_price=limit_px, intent_id=intent_id))
+                intent_id = (fo.get('intent_id') or fo.get('client_order_id')) if isinstance(fo, dict) else getattr(fo, 'client_order_id', None)
+                intent = OrderIntent(sym, side_str, qty, limit_px, intent_id)
+                validate_intents([intent], self.master, at(t_date, 9), self.seen_intent_ids)
+                self.frozen_orders_by_date[t_date].append(intent)
 
     def _is_cb(self, symbol: str) -> bool:
         inst = self.master.get(symbol)
@@ -655,7 +656,7 @@ class _ResearchStrategy(Strategy):
         previous_volume=next((b.volume for b in reversed(self.history[symbol]) if b.volume>0 and self.rules[(symbol,b.end.astimezone(TZ).date())]['trade_status']=='OPEN'),0)
         budget_key=(symbol,tick.ts_event)
         if not hasattr(self,'submission_budget'):self.submission_budget={}
-        available=self.submission_budget.setdefault(budget_key,int(D(previous_volume)*D(str(self.rate))))
+        available=self.submission_budget.setdefault(budget_key,max(int(D(previous_volume)*D(str(self.rate))), int(D(str(tick.ask_size)))))
         remaining=[]
         for created,intent in self.pending:
             if intent.symbol!=symbol or created>tick.ts_event or intent.side.upper()!=phase:
@@ -929,7 +930,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal,frozen_orders=frozen_orders,cash_exhaustion_policy=cash_exhaustion_policy)
         else:
             from engine.tape_replay import _TapeStrategy
-            strategy=_TapeStrategy(_prepared,_tape,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity)
+            strategy=_TapeStrategy(_prepared,_tape,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity, frozen_orders=frozen_orders, cash_exhaustion_policy=cash_exhaustion_policy)
         eng.add_strategy(strategy)
         bar_types={};statistics=dict(data_mode=data_mode,execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,market_events=0,boundary_events=0,peak_batch_events=0)
         if data_mode=='full':
@@ -1066,79 +1067,27 @@ def run_frozen_orders_backtest(
         corporate_actions = actions
 
     from engine.prepared import prepare_backtest, PreparedBacktest
-    from engine.order_tape import TimedOrderIntent, prepare_order_tape
+    from engine.order_tape import prepare_order_tape
     from engine.tape_replay import run_order_tape
-    from engine.intents import OrderIntent
 
     _prep = kwargs.pop('_prepared', None)
     if frozen_orders is not None:
         frozen_orders = tuple(frozen_orders)
-    can_fastpath = (
-        data_mode == 'orders'
-        and execution_mode in {'synthetic_l2', 'auction_open'}
-        and cash_exhaustion_policy == 'reject'
-        and frozen_orders is not None
-    )
-
-    if can_fastpath:
-        if _prep is not None:
-            prepared = _prep
-        else:
-            prepared = prepare_backtest(
-                instruments, bars, rules,
-                corporate_actions=corporate_actions,
-                trading_days=trading_days,
-                corporate_action_gate_policy=corporate_action_gate_policy
-            )
-
-        if prepared.daily_only and len(prepared.sessions) > 0:
-            session_indices = {day: idx for idx, day in enumerate(prepared.sessions)}
-            timed_intents = []
-            fastpath_valid = True
-
-            for fo in frozen_orders:
-                sym = getattr(fo, 'symbol', None) or (fo['symbol'] if isinstance(fo, dict) else None)
-                t_date = getattr(fo, 'trade_date', None) or (fo['trade_date'] if isinstance(fo, dict) else None)
-                if isinstance(t_date, str):
-                    t_date = date.fromisoformat(t_date)
-                side_val = getattr(fo, 'side', None) or (fo['side'] if isinstance(fo, dict) else None)
-                side_str = str(side_val).upper().replace('ORDERSIDE.', '')
-                qty = getattr(fo, 'quantity', None) if hasattr(fo, 'quantity') else fo['quantity']
-                limit_px = getattr(fo, 'limit_price', None) if hasattr(fo, 'limit_price') else (fo.get('limit_price') if isinstance(fo, dict) else None)
-                intent_id = getattr(fo, 'intent_id', None) if hasattr(fo, 'intent_id') else (fo.get('intent_id') if isinstance(fo, dict) else None)
-
-                idx = session_indices.get(t_date)
-                if idx is None or idx == 0:
-                    fastpath_valid = False
-                    break
-
-                prev_session = prepared.sessions[idx - 1]
-                previous_rule = prepared.rules.get((sym, prev_session), {})
-                if previous_rule.get("trade_status") != "OPEN" or not any(
-                    bar.symbol == sym and bar.volume > 0 for bar in prepared.bars_by_day[prev_session]
-                ):
-                    fastpath_valid = False
-                    break
-                dec_time = at(prev_session, 15)
-                oi = OrderIntent(
-                    symbol=sym, side=side_str, quantity=qty,
-                    limit_price=Decimal(str(limit_px)) if limit_px is not None else None,
-                    intent_id=intent_id
-                )
-                timed_intents.append(TimedOrderIntent(decision_time=dec_time, intent=oi))
-
-            if fastpath_valid and timed_intents:
-                tape = prepare_order_tape(prepared, timed_intents)
-                return run_order_tape(
-                    prepared, tape,
-                    initial_cash=initial_cash,
-                    participation_rate=participation_rate,
-                    fee_model=fee_model,
-                    execution_mode=execution_mode,
-                    cash_exhaustion_policy=cash_exhaustion_policy,
-                    corporate_action_gate_policy=corporate_action_gate_policy,
-                    **kwargs
-                )
+    if data_mode == 'orders' and frozen_orders is not None:
+        if _prep is None:
+            _prep = prepare_backtest(instruments, bars, rules, corporate_actions=corporate_actions,
+                trading_days=trading_days, corporate_action_gate_policy=corporate_action_gate_policy)
+        if type(_prep) is not PreparedBacktest:
+            raise TypeError('PreparedBacktest required')
+        _prep.assert_compatible()
+        if _prep.daily_only:
+            # Executable-date orders are injected by _start_day, never a fabricated decision.
+            return run_order_tape(_prep, prepare_order_tape(_prep, ()), frozen_orders=frozen_orders,
+                initial_cash=initial_cash, participation_rate=participation_rate, fee_model=fee_model,
+                execution_mode=execution_mode, cash_exhaustion_policy=cash_exhaustion_policy,
+                corporate_action_gate_policy=corporate_action_gate_policy, **kwargs)
+        instruments, bars, rules, trading_days = _prep.instruments, _prep.bars, _prep.rules, _prep.sessions
+        data_mode = 'full'  # Minute orders can remain active across multiple bars.
 
     return _run_backtest(
         instruments, bars, rules, signal=None, corporate_actions=corporate_actions,

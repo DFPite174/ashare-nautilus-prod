@@ -136,6 +136,7 @@ def test_frozen_after_blocked_session_preserves_execution():
     orders = [FrozenOrder(symbol="600519.SH", trade_date=dates[2], side="BUY", quantity=100)]
     full = run_frozen_orders_backtest(instruments, bars, rules, orders, data_mode="full")
     fast = run_frozen_orders_backtest(instruments, bars, rules, iter(orders))
+    assert fast.run_statistics["native_market_bars"] < len(bars)
     assert len(full.fills) == 1
     assert fast.fills == full.fills
     assert fast.daily_nav == full.daily_nav
@@ -148,8 +149,33 @@ def test_fastpath_propagates_execution_error(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("execution failed")
 
-    monkeypatch.setattr(replay, "run_order_tape", fail)
+    monkeypatch.setattr(replay._TapeStrategy, "on_start", fail)
     instruments, bars, rules, dates = make_market(3)
     orders = [FrozenOrder(symbol="600519.SH", trade_date=dates[1], side="BUY", quantity=100)]
     with pytest.raises(RuntimeError, match="execution failed"):
         run_frozen_orders_backtest(instruments, bars, rules, orders)
+
+def test_date_orders_preserve_ids_on_first_session():
+    instruments, bars, rules, dates = make_market(3)
+    # Opening depth is explicitly observed at the first session.
+    from dataclasses import replace
+    bars = [replace(b, open_volume=b.volume) for b in bars]
+    orders = [FrozenOrder(symbol="600519.SH", trade_date=dates[0], side="BUY",
+                          quantity=100, client_order_id="first")]
+    results = [run_frozen_orders_backtest(instruments, bars, rules, orders, data_mode=mode, participation_rate=1)
+               for mode in ("full", "orders")]
+    for result in results:
+        assert len(result.fills) == 1
+        assert result.fills[0]["intent_id"] == "first"
+    assert results[0].daily_nav == results[1].daily_nav
+
+def test_frozen_minute_orders_use_full_delivery():
+    from dataclasses import replace
+    from datetime import timedelta
+
+    instruments, bars, rules, dates = make_market(3)
+    bars = [replace(bar, end=bar.start + timedelta(minutes=1), open_volume=bar.volume) for bar in bars]
+    order = FrozenOrder(symbol="600519.SH", trade_date=dates[0], side="BUY", quantity=100)
+    result = run_frozen_orders_backtest(instruments, bars, rules, [order], participation_rate=1)
+    assert result.run_statistics["data_mode"] == "full"
+    assert [fill["quantity"] for fill in result.fills] == ["100"]
