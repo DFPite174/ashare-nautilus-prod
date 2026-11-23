@@ -3,7 +3,7 @@ from decimal import Decimal as D
 
 import pytest
 
-from engine.index_futures import IFContract, IFDay, IFOrder, IFPolicy, replay_if
+from engine.index_futures import IFContract, IFDay, IFOrder, IFPolicy, replay_if, replay_if_portfolio
 
 START = date(2023, 6, 14)
 DAYS = [START + timedelta(days=i) for i in range(3)]
@@ -91,3 +91,68 @@ def test_effective_policy_rebases_margin_and_charges_new_close_fee():
 def test_policy_schedule_requires_coverage_at_first_session():
     with pytest.raises(ValueError, match="first IF session"):
         replay_if(CONTRACT, market()[:2], [], initial_cash=D(200000), policy={DAYS[1]: POLICY})
+
+@pytest.mark.parametrize("cash,lock,expected_positions,expected_rejection", [
+    (200000, False, {"IF2306": 0, "IF2307": 1}, ()),
+    (200000, True, {"IF2306": 1, "IF2307": 0}, ((1, "LIMIT_LOCK"), (2, "INSUFFICIENT_MARGIN"))),
+])
+def test_roll_has_shared_margin_and_preserves_failed_leg(cash, lock, expected_positions, expected_rejection):
+    from dataclasses import replace
+
+    old = market()[:2]
+    if lock:
+        old[1] = replace(old[1], lower=old[1].open)
+    new = IFContract("IF2307", CONTRACT.listed, date(2023, 7, 21))
+    orders = [(CONTRACT.symbol, IFOrder(DAYS[0], "BUY", "OPEN", 1)),
+              (CONTRACT.symbol, IFOrder(DAYS[1], "SELL", "CLOSE_YESTERDAY", 1)),
+              (new.symbol, IFOrder(DAYS[1], "BUY", "OPEN", 1))]
+    result = replay_if_portfolio({CONTRACT: old, new: market()[:2]}, orders,
+                                 initial_cash=D(cash), policy=POLICY)
+    assert result.daily[-1].positions == expected_positions
+    assert result.daily[-1].cash == D(200000)
+    assert result.daily[-1].margin == D(144000)
+    assert result.rejections == expected_rejection
+
+
+def test_roll_open_first_cannot_spend_margin_from_future_close():
+    new = IFContract("IF2307", CONTRACT.listed, date(2023, 7, 21))
+    m = market()[:2]
+    orders = [(CONTRACT.symbol, IFOrder(DAYS[0], "BUY", "OPEN", 1)),
+              (new.symbol, IFOrder(DAYS[1], "BUY", "OPEN", 1)),
+              (CONTRACT.symbol, IFOrder(DAYS[1], "SELL", "CLOSE_YESTERDAY", 1))]
+    r = replay_if_portfolio({CONTRACT: m, new: m}, orders, initial_cash=D(200000), policy=POLICY)
+    assert r.rejections == ((1, "INSUFFICIENT_MARGIN"),)
+    assert r.daily[-1].positions == {"IF2306": 0, "IF2307": 0}
+    assert r.daily[-1].cash == D("201500.00")
+    assert r.daily[0].positions["IF2306"] == 1
+
+
+def test_missing_overlap_data_is_not_treated_as_zero_exposure():
+    new = IFContract("IF2307", CONTRACT.listed, date(2023, 7, 21))
+    with pytest.raises(ValueError, match="Missing IF session"):
+        replay_if_portfolio({CONTRACT: market()[:2], new: market()[1:2]}, [],
+                            initial_cash=D(200000), policy=POLICY)
+
+
+def test_calendar_detects_session_missing_for_all_contracts():
+    rows = market()
+    with pytest.raises(ValueError, match="trading calendar"):
+        replay_if_portfolio({CONTRACT: [rows[0], rows[-1]]}, [], initial_cash=D(200000),
+                            policy=POLICY, trading_days=DAYS)
+
+
+def test_cross_product_gap_funding_and_effective_contract_policy():
+    ic = IFContract("IC2306", CONTRACT.listed, CONTRACT.expiry)
+    market_days = market()[:2]
+    high_margin = IFPolicy(D(".25"), D(".0001"), D(0), D(0), D(0))
+    orders = [(ic.symbol, IFOrder(DAYS[0], "SELL", "OPEN", 1)),
+              (CONTRACT.symbol, IFOrder(DAYS[1], "BUY", "OPEN", 1))]
+    result = replay_if_portfolio({CONTRACT: market_days, ic: market_days}, orders, initial_cash=D(340000),
+                                 policy=POLICY, contract_policies={ic.symbol: {DAYS[0]: high_margin}})
+    assert result.order_symbols == ("IC2306", "IF2306")
+    assert result.rejections == ((1, "INSUFFICIENT_MARGIN"),)
+    assert result.daily[0].cash == D("337920.00")
+    assert result.daily[1].cash == D("339920.00")
+    assert result.daily[1].margin == D("200000.00")
+    assert result.daily[1].notionals == {"IF2306": D(0), "IC2306": D(-800000)}
+    assert result.daily[1].contract_policies == {"IF2306": POLICY, "IC2306": high_margin}
