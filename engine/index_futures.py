@@ -1,7 +1,7 @@
 """Daily CFFEX equity index futures replay and CNY settlement."""
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from datetime import date, datetime, time
 from decimal import Decimal as D, ROUND_HALF_UP
@@ -37,6 +37,23 @@ def _positive(value):
     return isinstance(value, D) and value.is_finite() and value > 0
 
 
+def _margin_requirement(notionals, policies, groups):
+    gross = ungrouped = D(0)
+    sides = {}
+    for symbol, notional in notionals.items():
+        if not notional:
+            continue
+        amount = _money(abs(notional) * policies[symbol].margin)
+        gross += amount
+        group = groups.get(symbol[:2])
+        if group is None:
+            ungrouped += amount
+        else:
+            side = sides.setdefault(group, [D(0), D(0)])
+            side[notional < 0] += amount
+    return gross, ungrouped + sum(max(side) for side in sides.values())
+
+
 @dataclass(frozen=True)
 class IFContract:
     symbol: str
@@ -65,6 +82,8 @@ class IFOrder:
     side: str
     effect: str
     lots: int
+    depends_on: int | None = None
+    allow_partial: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,6 +93,7 @@ class IFPolicy:
     close_today_fee: D
     close_yesterday_fee: D
     delivery_fee: D
+    submission_fee: D = D(0)
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,13 @@ class IFDaily:
     policy: IFPolicy
     contract_policies: Mapping[str, IFPolicy]
     notionals: Mapping[str, D]
+    gross_margin: D
+    submission_fees: D
+    cash_deposit: D
+
+    @property
+    def margin_shortfall(self):
+        return max(D(0), -self.available)
 
     @property
     def position(self):
@@ -111,15 +138,19 @@ class IFResult:
     rejections: tuple
     daily: tuple
     order_symbols: tuple[str, ...]
+    unfilled_lots: Mapping[int, int]
 
 
 class _IFReplay(Strategy):
-    def __init__(self, instruments, contracts, sessions, orders, order_symbols, cash, policies, overrides):
+    def __init__(self, instruments, contracts, sessions, orders, order_symbols, cash, policies, overrides,
+                 groups, deposits, confirm_before_next):
         super().__init__(StrategyConfig())
         self.instruments, self.contracts, self.sessions = instruments, contracts, sessions
         self.orders, self.cash, self.policies = orders, cash, policies
         self.order_symbols = order_symbols
         self.overrides = overrides
+        self.groups, self.deposits = groups, deposits
+        self.confirm_before_next = confirm_before_next
         self.multipliers = {s: c.multiplier for s, c in contracts.items()}
         self.carry = dict.fromkeys(contracts, 0)
         self.yesterday = self.carry.copy()
@@ -127,6 +158,8 @@ class _IFReplay(Strategy):
         self.previous_settle = {}
         self.fills, self.rejections, self.daily = [], [], []
         self.submitted = {}
+        self.unfilled_lots = {}
+        self.submission_fees = D(0)
         self.pending_delivery = {}
         self.fill_offset = 0
         self.symbols = {v.id: k for k, v in instruments.items()}
@@ -147,8 +180,10 @@ class _IFReplay(Strategy):
 
     def _execute(self, day, market):
         policies = self.overrides[day]
+        self.cash += self.deposits.get(day, D(0))
         capacity = {symbol: row.open_capacity for symbol, row in market.items()}
         today, yesterday = self.today.copy(), self.yesterday.copy()
+        completed = set()
         notionals = {s: row.open * self.multipliers[s] for s, row in market.items()}
         projected = self.cash + sum(
             q * (market[s].open - self.previous_settle[s]) * self.multipliers[s]
@@ -161,11 +196,13 @@ class _IFReplay(Strategy):
                 raise RuntimeError("Missing current IF opening quote")
             q = yesterday[symbol] + today[symbol]
             sign = 1 if order.side == "BUY" else -1
-            lots = sign * order.lots
+            executable = min(order.lots, capacity[symbol]) if order.allow_partial else order.lots
             reason = None
-            if (sign > 0 and row.open == row.upper) or (sign < 0 and row.open == row.lower):
+            if order.depends_on is not None and order.depends_on not in completed:
+                reason = "DEPENDENCY_UNFILLED"
+            elif (sign > 0 and row.open == row.upper) or (sign < 0 and row.open == row.lower):
                 reason = "LIMIT_LOCK"
-            elif order.lots > capacity[symbol]:
+            elif executable == 0 or executable > capacity[symbol]:
                 reason = "OPEN_CAPACITY"
             elif order.effect == "OPEN":
                 if q * sign < 0:
@@ -176,24 +213,37 @@ class _IFReplay(Strategy):
                     reason = "INSUFFICIENT_CLOSE_POSITION"
             rate = {"OPEN": policy.open_fee, "CLOSE_TODAY": policy.close_today_fee,
                     "CLOSE_YESTERDAY": policy.close_yesterday_fee}[order.effect]
-            fee = _money(notionals[symbol] * order.lots * rate)
+            fee = _money(notionals[symbol] * executable * rate)
             if not reason and order.effect == "OPEN":
-                margin = sum(_money(abs(yesterday[s] + today[s] + (lots if s == symbol else 0))
-                                    * amount * policies[s].margin) for s, amount in notionals.items())
-                if projected - fee < margin:
+                needed = {}
+                for s, amount in notionals.items():
+                    quantity = yesterday[s] + today[s] + (sign * executable if s == symbol else 0)
+                    if quantity:
+                        needed[s] = quantity * amount
+                _, margin = _margin_requirement(needed, policies, self.groups)
+                if projected - fee - policy.submission_fee < margin:
                     reason = "INSUFFICIENT_MARGIN"
             if reason:
                 self.rejections.append((index, reason))
                 continue
             native = self.order_factory.limit(
                 instrument_id=tick.instrument_id, order_side=OrderSide.BUY if sign > 0 else OrderSide.SELL,
-                quantity=Quantity.from_int(order.lots), price=tick.ask_price, time_in_force=TimeInForce.IOC)
-            self.submitted[str(native.client_order_id)] = (index, symbol, order, fee, row.open)
+                quantity=Quantity.from_int(executable), price=tick.ask_price, time_in_force=TimeInForce.IOC)
+            native_id = str(native.client_order_id)
+            executed_order = order if executable == order.lots else replace(order, lots=executable)
+            self.submitted[native_id] = (index, symbol, executed_order, fee, row.open)
             self.submit_order(native)
-            capacity[symbol] -= order.lots
+            if self.confirm_before_next and native_id in self.submitted:
+                raise RuntimeError("Reserved IF order did not fill synchronously in NautilusTrader")
+            capacity[symbol] -= executable
             bucket = yesterday if order.effect == "CLOSE_YESTERDAY" else today
-            bucket[symbol] += lots
-            projected -= fee
+            bucket[symbol] += sign * executable
+            self.submission_fees += policy.submission_fee
+            projected -= fee + policy.submission_fee
+            if executable == order.lots:
+                completed.add(index)
+            else:
+                self.unfilled_lots[index] = order.lots - executable
 
     def on_order_filled(self, event):
         order_id = str(event.client_order_id)
@@ -220,7 +270,7 @@ class _IFReplay(Strategy):
         positions = self.yesterday.copy()
         deliveries = dict.fromkeys(positions, 0)
         notionals = dict.fromkeys(positions, D(0))
-        variation = fees = margin = D(0)
+        variation, fees = D(0), self.submission_fees
         fills = defaultdict(list)
         for index, order, price, fee in self.fills[self.fill_offset:]:
             fills[self.order_symbols[index]].append((order, price))
@@ -247,12 +297,14 @@ class _IFReplay(Strategy):
             positions[symbol] = position
             deliveries[symbol] = delivered
             notionals[symbol] = position * settle * multiplier
-            margin += _money(abs(notionals[symbol]) * policy.margin)
             self.previous_settle[symbol] = settle
+        gross, margin = _margin_requirement({s: notionals[s] for s in policies}, policies, self.groups)
         self.cash += variation - fees
         self.daily.append(IFDaily(day, self.cash, MappingProxyType(positions), variation, fees, margin,
                                  self.cash-margin, MappingProxyType(deliveries), self.policies[day],
-                                 MappingProxyType(policies), MappingProxyType(notionals)))
+                                 MappingProxyType(policies), MappingProxyType(notionals), gross,
+                                 self.submission_fees, self.deposits.get(day, D(0))))
+        self.submission_fees = D(0)
         self.carry = positions
         self.yesterday, self.today = positions.copy(), dict.fromkeys(positions, 0)
         self.fill_offset = len(self.fills)
@@ -262,6 +314,9 @@ def _check_policy(policy):
     if not isinstance(policy, IFPolicy) or not _positive(policy.margin) or policy.margin > 1 or any(
         not isinstance(r, D) or not r.is_finite() or not 0 <= r <= 1
         for r in (policy.open_fee, policy.close_today_fee, policy.close_yesterday_fee, policy.delivery_fee)
+    ) or (
+        not isinstance(policy.submission_fee, D) or not policy.submission_fee.is_finite()
+        or policy.submission_fee < 0 or _money(policy.submission_fee) != policy.submission_fee
     ):
         raise ValueError("Invalid IF margin or fee policy")
 
@@ -289,13 +344,14 @@ def _effective_policies(days, policy):
     return policies
 
 
-def replay_if(contract, days, orders, *, initial_cash, policy):
+def replay_if(contract, days, orders, *, initial_cash, policy, cash_deposits=None):
     """Replay a single IF contract using the shared futures account."""
     return replay_if_portfolio({contract: days}, ((contract.symbol, order) for order in orders),
-                               initial_cash=initial_cash, policy=policy)
+                               initial_cash=initial_cash, policy=policy, cash_deposits=cash_deposits)
 
 
-def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_policies=None, trading_days=None):
+def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_policies=None, trading_days=None,
+                        margin_groups=(), cash_deposits=None):
     """Replay (symbol, IFOrder) pairs in input order on each execution date."""
     if not contracts or not _positive(initial_cash) or _money(initial_cash) != initial_cash:
         raise ValueError("Invalid IF contracts or external cash")
@@ -327,6 +383,18 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
     for day, rows in market.items():
         if any(c.listed <= day <= c.expiry and s not in rows for s, c in by_symbol.items()):
             raise ValueError(f"Missing IF session data on {day}")
+    groups = {}
+    for group_id, group in enumerate(margin_groups):
+        if isinstance(group, str) or not group:
+            raise ValueError("A margin group must contain one or more product codes")
+        for product in group:
+            if product not in PRODUCTS or product in groups:
+                raise ValueError("Unknown or repeated product in margin groups")
+            groups[product] = group_id
+    deposits = dict(cash_deposits or {})
+    if any(day not in market or not _positive(value) or _money(value) != value
+           for day, value in deposits.items()):
+        raise ValueError("A cash deposit requires a replay day and a positive cent amount")
     policies = _effective_policies(tuple(market), policy)
     contract_policies = {} if contract_policies is None else contract_policies
     if contract_policies.keys() - by_symbol.keys():
@@ -337,13 +405,20 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
                  for day, rows in market.items()}
     by_day = defaultdict(list)
     order_symbols = {}
+    order_days = []
+    confirm_before_next = False
     for index, (symbol, o) in enumerate(orders):
         if (symbol not in market.get(o.day, {}) or o.side not in {"BUY", "SELL"}
                 or type(o.lots) is not int or o.lots <= 0
-                or o.effect not in {"OPEN", "CLOSE_TODAY", "CLOSE_YESTERDAY"}):
+                or o.effect not in {"OPEN", "CLOSE_TODAY", "CLOSE_YESTERDAY"} or type(o.allow_partial) is not bool):
             raise ValueError(f"Invalid IF order at index {index}")
+        if o.depends_on is not None and (type(o.depends_on) is not int or not 0 <= o.depends_on < index
+                                         or order_days[o.depends_on] != o.day):
+            raise ValueError(f"Order dependency must refer to an earlier order on the same day: {index}")
+        confirm_before_next |= o.depends_on is not None
         by_day[o.day].append((index, symbol, o))
         order_symbols[index] = symbol
+        order_days.append(o.day)
     venue = Venue("CFFEX")
     instruments = {
         s: FuturesContract(InstrumentId(Symbol(s), venue), Symbol(s), AssetClass.INDEX,
@@ -365,10 +440,12 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
         delivery_prices = {instruments[s].id: float(row.delivery) for rows in market.values()
                            for s, row in rows.items() if row.delivery is not None}
         engine.add_venue(venue, OmsType.NETTING, AccountType.MARGIN, [Money(initial_cash, CNY)],
-                         base_currency=CNY, frozen_account=True, settlement_prices=delivery_prices)
+                         base_currency=CNY, frozen_account=True, settlement_prices=delivery_prices,
+                         use_message_queue=not confirm_before_next)
         for instrument in instruments.values():
             engine.add_instrument(instrument)
-        strategy = _IFReplay(instruments, by_symbol, market, by_day, order_symbols, initial_cash, policies, overrides)
+        strategy = _IFReplay(instruments, by_symbol, market, by_day, order_symbols, initial_cash,
+                             policies, overrides, groups, deposits, confirm_before_next)
         engine.add_strategy(strategy)
         engine.add_data(ticks)
         engine.run(end=_ns(max(market), 15) + 2)
@@ -376,6 +453,7 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
             raise RuntimeError("Missing daily IF settlement")
         if strategy.pending_delivery:
             raise RuntimeError("Missing NautilusTrader expiry fill")
-        return IFResult(tuple(strategy.fills), tuple(strategy.rejections), tuple(strategy.daily), tuple(order_symbols.values()))
+        return IFResult(tuple(strategy.fills), tuple(strategy.rejections), tuple(strategy.daily),
+                        tuple(order_symbols.values()), MappingProxyType(strategy.unfilled_lots))
     finally:
         engine.dispose()

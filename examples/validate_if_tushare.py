@@ -1,6 +1,7 @@
 """Verify opening, rolls and expiry against the local Tushare lake and a CFFEX notice."""
 import argparse
 from datetime import date
+from dataclasses import replace
 from decimal import Decimal as D, ROUND_HALF_UP
 from pathlib import Path
 import sys
@@ -57,12 +58,17 @@ def validate_cross_product(lake, trading_days):
               for i, contract in enumerate(contracts)]
     sample = replay_if_portfolio(contracts, orders, initial_cash=initial_cash, policy=policies["IF2306"],
                                  contract_policies=policies, trading_days=trading_days)
+    revised = {s: replace(p, submission_fee=D(1)) if s.startswith("IM") else p for s, p in policies.items()}
+    offset = replay_if_portfolio(contracts, orders, initial_cash=initial_cash, policy=policies["IF2306"],
+                                 contract_policies=revised, trading_days=trading_days,
+                                 margin_groups=[("IF", "IH", "IC", "IM")])
     assert not sample.rejections and len(sample.fills) == 4
     cents = lambda v: v.quantize(D(".01"), rounding=ROUND_HALF_UP)
     opening_fees = sum(cents(rows[0].open * MULTIPLIERS[c.symbol[:2]] * policies[c.symbol].open_fee)
                        for c, rows in contracts.items())
     for i, account in enumerate(sample.daily):
         pnl, margin = D(0), D(0)
+        long_margin, short_margin = D(0), D(0)
         fees = opening_fees
         for j, (c, rows) in enumerate(contracts.items()):
             point_value = MULTIPLIERS[c.symbol[:2]]
@@ -73,13 +79,42 @@ def validate_cross_product(lake, trading_days):
             if settled:
                 fees += cents(marked_value * policies[c.symbol].delivery_fee)
             else:
-                margin += cents(marked_value * policies[c.symbol].margin)
+                leg_margin = cents(marked_value * policies[c.symbol].margin)
+                margin += leg_margin
+                if side > 0:
+                    long_margin += leg_margin
+                else:
+                    short_margin += leg_margin
             assert account.positions[c.symbol] == (0 if settled else side)
             assert account.deliveries[c.symbol] == (side if settled else 0)
             assert account.notionals[c.symbol] == account.positions[c.symbol] * marked_value
         assert (account.cash, account.margin, account.available) == (initial_cash + pnl - fees, margin,
                                                                     initial_cash + pnl - fees - margin)
+        net = offset.daily[i]
+        assert net.positions == account.positions and net.cash == account.cash - 1
+        assert net.gross_margin == margin and net.margin == max(long_margin, short_margin)
+        assert net.submission_fees == int(i == 0)
     print("IF/IH/IC/IM", sample.daily[-1].cash, dict(sample.daily[-1].deliveries), sample.daily[-1].margin)
+    print("IM submission / gross vs max side", offset.daily[-1].cash,
+          offset.daily[0].gross_margin, offset.daily[0].margin)
+
+
+def validate_linked_roll(old, days, new, new_days, policy):
+    first, next_day = days[:2]
+    orders = [(old.symbol, IFOrder(first.day, "BUY", "OPEN", 2)),
+              (old.symbol, IFOrder(next_day.day, "SELL", "CLOSE_YESTERDAY", 2, allow_partial=True)),
+              (new.symbol, IFOrder(next_day.day, "BUY", "OPEN", 2, depends_on=1))]
+    for capacity in (0, 1, 2):
+        result = replay_if_portfolio(
+            {old: [first, replace(next_day, open_capacity=capacity)], new: new_days[:2]}, orders,
+            initial_cash=D(900000), policy=policy, cash_deposits={next_day.day: D(10000)},
+        )
+        row = result.daily[-1]
+        assert row.cash_deposit == D(10000)
+        assert row.positions == {old.symbol: 2-capacity, new.symbol: 2 if capacity == 2 else 0}
+        assert result.unfilled_lots.get(1) == (1 if capacity == 1 else None)
+        assert ((2, "DEPENDENCY_UNFILLED") in result.rejections) == (capacity < 2)
+        print("linked roll", capacity, dict(row.positions), result.rejections, dict(result.unfilled_lots))
 
 
 def validate_equity_overlay(root, contract, days, policy):
@@ -165,6 +200,7 @@ def main():
     assert result.daily[-1].delivered_position == -1
 
     new_contract, new_days = load_sample(lake, "IF2307.CFX")
+    validate_linked_roll(contract, days, new_contract, new_days, policy)
     roll_day = days[2].day
     exit_old = IFOrder(roll_day, "BUY", "CLOSE_YESTERDAY", 1)
     enter_new = IFOrder(roll_day, "SELL", "OPEN", 1)

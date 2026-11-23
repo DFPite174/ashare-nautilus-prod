@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal as D
 
@@ -174,3 +175,69 @@ def test_cross_product_gap_funding_and_effective_contract_policy():
     assert result.daily[1].margin == D("200000.00")
     assert result.daily[1].notionals == {"IF2306": D(0), "IC2306": D(-800000)}
     assert result.daily[1].contract_policies == {"IF2306": POLICY, "IC2306": high_margin}
+
+
+@pytest.mark.parametrize("capacity,expected", [(0, 1), (1, 1), (2, 0)])
+def test_linked_roll_requires_complete_confirmed_close(capacity, expected):
+    new = IFContract("IF2307", CONTRACT.listed, date(2023, 7, 21))
+    a, b = market()[:2]
+    orders = [(CONTRACT.symbol, IFOrder(a.day, "BUY", "OPEN", 2)),
+              (CONTRACT.symbol, IFOrder(b.day, "SELL", "CLOSE_YESTERDAY", 2, allow_partial=True)),
+              (new.symbol, IFOrder(b.day, "BUY", "OPEN", 2, depends_on=1))]
+    r = replay_if_portfolio({CONTRACT: [a, replace(b, open_capacity=capacity)], new: [a, b]},
+                            orders, initial_cash=D(900000), policy=POLICY)
+    assert r.daily[-1].positions == {CONTRACT.symbol: 2-capacity, new.symbol: 2*(1-expected)}
+    assert any(reason == "DEPENDENCY_UNFILLED" for _, reason in r.rejections) == bool(expected)
+    assert r.unfilled_lots.get(1, 0) == (1 if capacity == 1 else 0)
+
+
+def test_offset_uses_larger_aggregate_side():
+    ic = IFContract("IC2306", CONTRACT.listed, CONTRACT.expiry)
+    a, b = market()[:2]
+    policy = replace(POLICY, margin=D(".20"))
+    # The opposite leg offsets both IF lots; the larger side sets the margin.
+    orders = [(ic.symbol, IFOrder(a.day, "SELL", "OPEN", 2)),
+              (CONTRACT.symbol, IFOrder(a.day, "BUY", "OPEN", 2)),
+              (ic.symbol, IFOrder(b.day, "BUY", "CLOSE_YESTERDAY", 2))]
+    rows = {CONTRACT: [a, replace(b, open=D(4100), settle=D(4100), upper=D(4120))], ic: [a, b]}
+    r = replay_if_portfolio(rows, orders, initial_cash=D(500000), policy=policy,
+                            margin_groups=[("IF", "IC")])
+    assert r.daily[0].margin == D(481200)
+    assert r.daily[0].gross_margin == D(802000)
+    assert not r.rejections
+    gross = replay_if_portfolio(rows, orders, initial_cash=D(500000), policy=policy)
+    assert gross.rejections == ((1, "INSUFFICIENT_MARGIN"),)
+
+
+def test_submission_fee_partial_fill_and_explicit_cash_deposit():
+    a, b = market()[:2]
+    orders = [(CONTRACT.symbol, IFOrder(a.day, "BUY", "OPEN", 2, allow_partial=True)),
+              (CONTRACT.symbol, IFOrder(a.day, "BUY", "OPEN", 1)),
+              (CONTRACT.symbol, IFOrder(b.day, "SELL", "CLOSE_YESTERDAY", 1))]
+    r = replay_if_portfolio({CONTRACT: [replace(a, open_capacity=1), b]}, orders,
+                            initial_cash=D(350000), policy=replace(POLICY, submission_fee=D(1)),
+                            cash_deposits={b.day: D(250)})
+    assert [fill[1].lots for fill in r.fills] == [1, 1]
+    assert r.rejections == ((1, "OPEN_CAPACITY"),)
+    assert r.daily[0].submission_fees == 1
+    assert r.daily[1].cash_deposit == 250
+    assert r.daily[1].cash == D(351748)
+
+
+def test_previous_close_shortfall_can_be_funded_before_next_open():
+    a, b = market()[:2]
+    rows = {CONTRACT: [replace(a, settle=D(3950)), replace(b, open=D(3950), settle=D(3950))]}
+    orders = [(CONTRACT.symbol, IFOrder(day, "BUY", "OPEN", 1)) for day in (a.day, b.day)]
+    r = replay_if_portfolio(rows, orders, initial_cash=D(145000), policy=POLICY,
+                            cash_deposits={b.day: D(160000)})
+    assert r.daily[0].margin_shortfall == D(12200)
+    assert r.daily[1].cash_deposit == D(160000)
+    assert r.daily[1].available == D(5600)
+    assert r.daily[1].margin_shortfall == 0 and r.daily[1].positions[CONTRACT.symbol] == 2
+
+
+def test_dependency_must_be_an_earlier_order_on_the_same_day():
+    a, b = market()[:2]
+    orders = [IFOrder(a.day, "BUY", "OPEN", 1), IFOrder(b.day, "SELL", "CLOSE_YESTERDAY", 1, depends_on=0)]
+    with pytest.raises(ValueError, match="same day"):
+        replay_if(CONTRACT, [a, b], orders, initial_cash=D(350000), policy=POLICY)
