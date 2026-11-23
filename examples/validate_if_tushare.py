@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine.futures_reconciliation import IFSettlementStatement, compare_daily_settlement
 from engine.index_futures import (IFContract, IFDay, IFOpeningQuote, IFOrder, IFPolicy, IFReferenceFill,
                                   IFReferenceOrder, compare_opening_fills, replay_if, replay_if_portfolio)
 
@@ -60,7 +61,8 @@ def validate_cross_product(lake, trading_days):
     orders = [(contract.symbol, IFOrder(trading_days[0], "SELL" if i % 2 else "BUY", "OPEN", 1))
               for i, contract in enumerate(contracts)]
     sample = replay_if_portfolio(contracts, orders, initial_cash=initial_cash, policy=policies["IF2306"],
-                                 contract_policies=policies, trading_days=trading_days)
+                                 contract_policies=policies, trading_days=trading_days, audit=True,
+                                 data_snapshot_id="local-tushare-2023-06", capacity_model="previous-day-volume-1pct")
     revised = {s: replace(p, submission_fee=D(1)) if s.startswith("IM") else p for s, p in policies.items()}
     offset = replay_if_portfolio(contracts, orders, initial_cash=initial_cash, policy=policies["IF2306"],
                                  contract_policies=revised, trading_days=trading_days,
@@ -69,10 +71,13 @@ def validate_cross_product(lake, trading_days):
     cents = lambda v: v.quantize(D(".01"), rounding=ROUND_HALF_UP)
     opening_fees = sum(cents(rows[0].open * MULTIPLIERS[c.symbol[:2]] * policies[c.symbol].open_fee)
                        for c, rows in contracts.items())
+    statements = []
+    previous_pnl = previous_fees = D(0)
     for i, account in enumerate(sample.daily):
         pnl, margin = D(0), D(0)
         long_margin, short_margin = D(0), D(0)
         fees = opening_fees
+        positions, deliveries = {}, {}
         for j, (c, rows) in enumerate(contracts.items()):
             point_value = MULTIPLIERS[c.symbol[:2]]
             marked_value = rows[i].settle * point_value
@@ -81,7 +86,9 @@ def validate_cross_product(lake, trading_days):
             pnl += (marked_value - rows[0].open * point_value) * side
             if settled:
                 fees += cents(marked_value * policies[c.symbol].delivery_fee)
+                deliveries[c.symbol] = side
             else:
+                positions[c.symbol] = side
                 leg_margin = cents(marked_value * policies[c.symbol].margin)
                 margin += leg_margin
                 if side > 0:
@@ -97,6 +104,19 @@ def validate_cross_product(lake, trading_days):
         assert net.positions == account.positions and net.cash == account.cash - 1
         assert net.gross_margin == margin and net.margin == max(long_margin, short_margin)
         assert net.submission_fees == int(i == 0)
+        cash = initial_cash + pnl - fees
+        statements.append(IFSettlementStatement(trading_days[i], cash, pnl-previous_pnl, fees-previous_fees,
+                                                margin, cash-margin, D(0), positions, deliveries))
+        previous_pnl, previous_fees = pnl, fees
+    statement_report = compare_daily_settlement(sample, statements, opening_cash=initial_cash,
+                                               source="independent-marked-positions")
+    assert statement_report.accepted
+    wrong = replace(statements[-1], deliveries={})
+    delivery_report = compare_daily_settlement(sample, [*statements[:-1], wrong], opening_cash=initial_cash,
+                                              source="controlled-missing-deliveries")
+    assert {d.field for d in delivery_report.differences} == {f"deliveries.{s}" for s in DELIVERY}
+    print("daily settlement", statement_report.covered_days, statement_report.accepted,
+          [d.field for d in delivery_report.differences])
     print("IF/IH/IC/IM", sample.daily[-1].cash, dict(sample.daily[-1].deliveries), sample.daily[-1].margin)
     print("IM submission / gross vs max side", offset.daily[-1].cash,
           offset.daily[0].gross_margin, offset.daily[0].margin)

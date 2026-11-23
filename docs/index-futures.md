@@ -27,6 +27,10 @@
 
 **日终账户。** 现金反映结算盈亏、费用和外部补资。可用资金等于现金减占用保证金。`gross_margin` 单列无抵扣的保证金，`margin_shortfall` 记录资金缺口，主动减仓仍可执行。名义敞口以结算价计量，带多空符号，交割后归零。
 
+**外部结算单对账。** 使用 `engine.futures_reconciliation.compare_daily_settlement(result, statements, opening_cash=..., source=...)`，传入开启审计的回放结果与独立的 `IFSettlementStatement`。以人民币分为精度，逐日比较资金、结算盈亏、总费用、保证金、可用资金、补资、净持仓及现金交割手数，可选比较申报费。参考持仓和交割采用有符号手数，零头寸可省略。输入应按回放的单账户净持仓、期末结算和保证金口径标准化。
+
+从独立起始资金核对参考结算单的现金衔接和可用资金等式。漏日、额外日期与字段差异均保留在结果中，重复日期或回放指纹不符时拒绝验收。结果的 `accepted` 仅在完整覆盖、金额和仓位全部一致时为真。参考结算单和回放均绑定指纹，金额差异包含期望值和收到值。示例独立复算四品种现金交割，并注入遗漏的交割腿验证差异定位。
+
 ```powershell
 python examples/validate_if_tushare.py --root "C:\path\to\Tushare_DB"
 ```
