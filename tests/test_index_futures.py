@@ -71,3 +71,23 @@ def test_reports_margin_deficit_and_allows_reducing_risk():
     assert result.rejections == ((1, "INSUFFICIENT_MARGIN"),)
     assert result.daily[-1].position == 0
     assert result.daily[-1].cash == D(130000)
+
+def test_effective_policy_rebases_margin_and_charges_new_close_fee():
+    old = IFPolicy(D(".10"), D(".0001"), D(0), D(0), D(0))
+    new = IFPolicy(D(".20"), D(0), D(0), D(".0003"), D(0))
+    orders = [IFOrder(DAYS[0], "BUY", "OPEN", 1), IFOrder(DAYS[1], "BUY", "OPEN", 1),
+              IFOrder(DAYS[1], "SELL", "CLOSE_YESTERDAY", 1)]
+    result = replay_if(CONTRACT, market()[:2], orders, initial_cash=D(200000),
+                       policy={DAYS[1]: new, DAYS[0]: old})
+    assert result.rejections == ((1, "INSUFFICIENT_MARGIN"),)
+    assert [d.fees for d in result.daily] == [D("120.00"), D("360.45")]
+    assert result.daily[-1].cash == D("201019.55")
+    held = replay_if(CONTRACT, market()[:2], orders[:1], initial_cash=D(200000),
+                     policy={DAYS[0]: old, DAYS[1]: new})
+    assert [d.margin for d in held.daily] == [D("120300.00"), D("240000.00")]
+    assert held.daily[-1].available == D("-40120.00")
+
+
+def test_policy_schedule_requires_coverage_at_first_session():
+    with pytest.raises(ValueError, match="first IF session"):
+        replay_if(CONTRACT, market()[:2], [], initial_cash=D(200000), policy={DAYS[1]: POLICY})

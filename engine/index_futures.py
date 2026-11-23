@@ -1,5 +1,6 @@
 """Single-contract daily IF replay; Nautilus matches, this module settles in CNY."""
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal as D, ROUND_HALF_UP
@@ -79,6 +80,7 @@ class IFDaily:
     margin: D
     available: D
     delivered_position: int
+    policy: IFPolicy
 
 
 @dataclass(frozen=True)
@@ -89,14 +91,14 @@ class IFResult:
 
 
 class _IFReplay(Strategy):
-    def __init__(self, instrument, contract, days, orders, cash, policy):
+    def __init__(self, instrument, contract, days, orders, cash, policies):
         super().__init__(StrategyConfig())
         self.instrument = instrument
         self.contract = contract
         self.days = days
         self.orders = orders
         self.cash = cash
-        self.policy = policy
+        self.policies = policies
         self.yesterday = self.today = 0
         self.previous_settle = None
         self.fills, self.rejections, self.daily = [], [], []
@@ -111,6 +113,7 @@ class _IFReplay(Strategy):
 
     def on_quote_tick(self, tick):
         day = self.days[tick.ts_event]
+        policy = self.policies[day.day]
         capacity = day.open_capacity
         q = self.yesterday
         projected = self.cash + (D(q) * (day.open - self.previous_settle) * MULTIPLIER if q else 0)
@@ -136,10 +139,10 @@ class _IFReplay(Strategy):
                     new_today += lots
                 else:
                     new_yesterday += lots
-            rate = {"OPEN": self.policy.open_fee, "CLOSE_TODAY": self.policy.close_today_fee,
-                    "CLOSE_YESTERDAY": self.policy.close_yesterday_fee}[order.effect]
+            rate = {"OPEN": policy.open_fee, "CLOSE_TODAY": policy.close_today_fee,
+                    "CLOSE_YESTERDAY": policy.close_yesterday_fee}[order.effect]
             fee = _money(day.open * MULTIPLIER * order.lots * rate)
-            margin = _money(abs(q + lots) * day.open * MULTIPLIER * self.policy.margin)
+            margin = _money(abs(q + lots) * day.open * MULTIPLIER * policy.margin)
             if not reason and order.effect == "OPEN" and projected - fee < margin:
                 reason = "INSUFFICIENT_MARGIN"
             if reason:
@@ -167,6 +170,7 @@ class _IFReplay(Strategy):
         self.fills.append((index, order, price, fee))
 
     def _settle(self, day):
+        policy = self.policies[day.day]
         if self.submitted:
             raise RuntimeError("Reserved IF orders did not fill in NautilusTrader")
         position = self.yesterday + self.today
@@ -184,15 +188,46 @@ class _IFReplay(Strategy):
         variation = _money(variation * MULTIPLIER)
         fees = sum((fee for _, _, _, fee in daily_fills), D(0))
         if delivered:
-            fees += _money(abs(delivered) * settle * MULTIPLIER * self.policy.delivery_fee)
+            fees += _money(abs(delivered) * settle * MULTIPLIER * policy.delivery_fee)
             position = 0
         self.cash += variation - fees
-        margin = _money(abs(position) * settle * MULTIPLIER * self.policy.margin)
+        margin = _money(abs(position) * settle * MULTIPLIER * policy.margin)
         self.daily.append(IFDaily(day.day, self.cash, position, variation, fees, margin,
-                                 self.cash-margin, delivered))
+                                 self.cash-margin, delivered, policy))
         self.previous_settle = settle
         self.yesterday, self.today = position, 0
         self.fill_offset = len(self.fills)
+
+
+def _check_policy(policy):
+    if not isinstance(policy, IFPolicy) or not _positive(policy.margin) or policy.margin > 1 or any(
+        not isinstance(r, D) or not r.is_finite() or not 0 <= r <= 1
+        for r in (policy.open_fee, policy.close_today_fee, policy.close_yesterday_fee, policy.delivery_fee)
+    ):
+        raise ValueError("Invalid IF margin or fee policy")
+
+
+def _effective_policies(days, policy):
+    if not isinstance(policy, Mapping):
+        _check_policy(policy)
+        return dict.fromkeys(days, policy)
+    schedule = list(policy.items())
+    if any(type(key) is not date for key, _ in schedule):
+        raise ValueError("IF policy effective date must be a date")
+    for _, item in schedule:
+        _check_policy(item)
+    schedule.sort()
+    active = None
+    index = 0
+    policies = {}
+    for day in days:
+        while index < len(schedule) and schedule[index][0] <= day:
+            active = schedule[index][1]
+            index += 1
+        if active is None:
+            raise ValueError("Policy schedule does not cover the first IF session")
+        policies[day] = active
+    return policies
 
 
 def replay_if(contract, days, orders, *, initial_cash, policy):
@@ -201,11 +236,6 @@ def replay_if(contract, days, orders, *, initial_cash, policy):
     if (not re.fullmatch(r"IF\d{4}", contract.symbol) or contract.listed > contract.expiry
             or not days or not _positive(initial_cash) or _money(initial_cash) != initial_cash):
         raise ValueError("Invalid IF contract, sessions or external cash")
-    if not _positive(policy.margin) or policy.margin > 1 or any(
-        not isinstance(r, D) or not r.is_finite() or not 0 <= r <= 1
-        for r in (policy.open_fee, policy.close_today_fee, policy.close_yesterday_fee, policy.delivery_fee)
-    ):
-        raise ValueError("Invalid IF margin or fee policy")
     previous = None
     for d in days:
         if (not contract.listed <= d.day <= contract.expiry or (previous is not None and d.day <= previous)
@@ -217,7 +247,8 @@ def replay_if(contract, days, orders, *, initial_cash, policy):
         if d.delivery is not None and (d.day != contract.expiry or not _positive(d.delivery)):
             raise ValueError("Invalid delivery settlement input")
         previous = d.day
-    sessions = {d.day for d in days}
+    policies = _effective_policies(tuple(d.day for d in days), policy)
+    sessions = policies.keys()
     by_day = defaultdict(list)
     for index, o in enumerate(orders):
         if (o.day not in sessions or o.side not in {"BUY", "SELL"} or type(o.lots) is not int or o.lots <= 0
@@ -230,7 +261,7 @@ def replay_if(contract, days, orders, *, initial_cash, policy):
         InstrumentId(Symbol(contract.symbol), venue), Symbol(contract.symbol), AssetClass.INDEX,
         CNY, 1, Price.from_str("0.2"), Quantity.from_int(300), Quantity.from_int(1), "CSI300",
         _ns(contract.listed, 0), _ns(contract.expiry + timedelta(days=1), 0),
-        0, 0, margin_init=policy.margin, margin_maint=policy.margin)
+        0, 0, margin_init=policies[days[0].day].margin, margin_maint=policies[days[0].day].margin)
     by_ns = {_ns(d.day, 9, 30): d for d in days}
     ticks = []
     for ns, day in by_ns.items():
@@ -243,7 +274,7 @@ def replay_if(contract, days, orders, *, initial_cash, policy):
         engine.add_venue(venue, OmsType.NETTING, AccountType.MARGIN, [Money(initial_cash, CNY)],
                          base_currency=CNY, frozen_account=True)
         engine.add_instrument(instrument)
-        strategy = _IFReplay(instrument, contract, by_ns, by_day, initial_cash, policy)
+        strategy = _IFReplay(instrument, contract, by_ns, by_day, initial_cash, policies)
         engine.add_strategy(strategy)
         engine.add_data(ticks)
         engine.run(end=_ns(days[-1].day, 15) + 1)

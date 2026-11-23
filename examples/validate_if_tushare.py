@@ -44,21 +44,25 @@ def main():
     initial = D(1000000)
     # Scenario margin and fees, not reconstructed brokerage terms.
     policy = IFPolicy(D(".12"), D(".0001"), D(".0002"), D(".0001"), D(".0001"))
+    policies = {days[0].day: policy, days[2].day: IFPolicy(
+        D(".15"), D(".0001"), D(".0002"), D(".0001"), D(".0002"))}
     short = IFOrder(days[0].day, "SELL", "OPEN", 1)
-    result = replay_if(contract, days, [short], initial_cash=initial, policy=policy)
+    result = replay_if(contract, days, [short], initial_cash=initial, policy=policies)
     cents = lambda v: v.quantize(D(".01"), rounding=ROUND_HALF_UP)
     cash = initial
     prior = days[0].open
     for i, (day, account) in enumerate(zip(days, result.daily, strict=True)):
+        active = policies[days[0].day if i < 2 else days[2].day]
+        assert account.policy == active
         delivered = day.day == expiry
         mark = day.delivery if delivered else day.settle
         variation = cents((prior - mark) * 300)
-        fees = (cents(day.open * 300 * policy.open_fee) if i == 0 else D(0))
+        fees = (cents(day.open * 300 * active.open_fee) if i == 0 else D(0))
         if delivered:
-            fees += cents(mark * 300 * policy.delivery_fee)
+            fees += cents(mark * 300 * active.delivery_fee)
         cash += variation - fees
         assert (account.cash, account.variation, account.fees, account.margin, account.position) == (
-            cash, variation, fees, D(0) if delivered else cents(mark * 300 * policy.margin),
+            cash, variation, fees, D(0) if delivered else cents(mark * 300 * active.margin),
             0 if delivered else -1)
         prior = mark
         print(day.day, f"variation={variation} fees={fees} cash={cash} margin={account.margin}")
