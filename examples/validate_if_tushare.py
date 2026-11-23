@@ -3,6 +3,7 @@ import argparse
 from datetime import date
 from dataclasses import replace
 from decimal import Decimal as D, ROUND_HALF_UP
+from hashlib import file_digest, sha256
 from pathlib import Path
 import sys
 
@@ -117,6 +118,32 @@ def validate_linked_roll(old, days, new, new_days, policy):
         print("linked roll", capacity, dict(row.positions), result.rejections, dict(result.unfilled_lots))
 
 
+def validate_risk_audit(lake):
+    contract, days = load_sample(lake, "IM2306.CFX")
+    day = days[0]
+    assert day.open_capacity >= 20
+    policy = IFPolicy(D(".18"), D(".000023"), D(".00023"), D(".000023"), D(".0001"),
+                      submission_fee=D(1), max_order_lots=20, max_position_lots=1200, max_daily_open_lots=500)
+    orders = [IFOrder(day.day, "BUY", "OPEN", 21),
+              IFOrder(day.day, "BUY", "OPEN", 20, limit_price=day.open),
+              IFOrder(day.day, "BUY", "OPEN", 1, limit_price=day.open - D(".2"))]
+    snapshot = sha256()
+    for relative in ("meta/fut_basic.parquet", "futures/daily/year=2023/fut_daily_2023.parquet"):
+        with (lake / relative).open("rb") as source:
+            snapshot.update(file_digest(source, "sha256").digest())
+    options = dict(initial_cash=D(10000000), policy=policy, audit=True,
+                   data_snapshot_id=snapshot.hexdigest(), capacity_model="previous-day-volume-1pct")
+    result = replay_if(contract, [day], orders, **options)
+    again = replay_if(contract, [day], iter(orders), **options)
+    assert result.evidence == again.evidence
+    assert result.rejections == ((0, "ORDER_LIMIT"), (2, "NOT_MARKETABLE"))
+    assert [o["unfilled_lots"] for o in result.evidence["orders"]] == [21, 0, 1]
+    assert result.daily[-1].position == 20
+    assert result.daily[-1].submission_fees == D(1)
+    print("IM opening risk and audit", result.rejections, result.daily[-1].position,
+          result.evidence["input_sha256"], result.evidence["result_sha256"])
+
+
 def validate_equity_overlay(root, contract, days, policy):
     from engine import run_frozen_orders_backtest
     from engine.tushare_lake import load_tushare_lake
@@ -224,6 +251,7 @@ def main():
     print("IF2306 -> IF2307", portfolio.daily[-1].cash, dict(portfolio.daily[-1].positions),
           portfolio.daily[-1].margin)
     validate_cross_product(lake, trading_days)
+    validate_risk_audit(lake)
     validate_equity_overlay(root, contract, days, policies)
 
 

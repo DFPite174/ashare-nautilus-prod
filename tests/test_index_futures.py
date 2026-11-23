@@ -241,3 +241,46 @@ def test_dependency_must_be_an_earlier_order_on_the_same_day():
     orders = [IFOrder(a.day, "BUY", "OPEN", 1), IFOrder(b.day, "SELL", "CLOSE_YESTERDAY", 1, depends_on=0)]
     with pytest.raises(ValueError, match="same day"):
         replay_if(CONTRACT, [a, b], orders, initial_cash=D(350000), policy=POLICY)
+
+
+def test_order_position_and_daily_open_limits_bind_independently():
+    a, b = market()[:2]
+    policy = replace(POLICY, max_order_lots=2, max_position_lots=2, max_daily_open_lots=3)
+    orders = [IFOrder(a.day, side, effect, lots) for side, effect, lots in (
+        ("BUY", "OPEN", 3), ("BUY", "OPEN", 2), ("BUY", "OPEN", 1),
+        ("SELL", "CLOSE_TODAY", 2), ("BUY", "OPEN", 2), ("BUY", "OPEN", 1),
+    )]
+    orders.append(IFOrder(b.day, "BUY", "OPEN", 1))
+    r = replay_if(CONTRACT, [a, b], orders, initial_cash=D(1000000), policy=policy)
+    assert r.rejections == ((0, "ORDER_LIMIT"), (2, "POSITION_LIMIT"), (4, "DAILY_OPEN_LIMIT"))
+    assert [row.position for row in r.daily] == [1, 2]
+    assert [f[0] for f in r.fills] == [1, 3, 5, 6]
+
+
+def test_replay_evidence_reconciles_input_orders_and_detects_data_changes():
+    row = replace(market()[0], open_capacity=1)
+    orders = [IFOrder(row.day, "BUY", "OPEN", 2, allow_partial=True, limit_price=D(4000)),
+              IFOrder(row.day, "BUY", "OPEN", 1, limit_price=D(3999))]
+    options = dict(initial_cash=D(500000), policy=POLICY, audit=True, data_snapshot_id="local-test",
+                   capacity_model="opening-volume-scenario")
+    r = replay_if(CONTRACT, [row], orders, **options)
+    again = replay_if(CONTRACT, [row], iter(orders), **options)
+    changed = replay_if(CONTRACT, [replace(row, settle=D(4020))], orders, **options)
+    assert r.evidence == again.evidence
+    assert r.evidence["input_sha256"] != changed.evidence["input_sha256"]
+    assert r.evidence["result_sha256"] != changed.evidence["result_sha256"]
+    first, second = r.evidence["orders"]
+    assert (first["requested_lots"], first["filled_lots"], first["unfilled_lots"]) == (2, 1, 1)
+    assert first["fill_ts_ns"] is not None
+    assert (first["available_opening_lots"], second["available_opening_lots"]) == (1, 0)
+    assert (second["reason"], second["unfilled_lots"]) == ("NOT_MARKETABLE", 1)
+
+
+def test_limit_prices_book_the_native_open_for_both_sides():
+    a, b = market()[:2]
+    orders = [IFOrder(a.day, "BUY", "OPEN", 1, limit_price=D(4010)),
+              IFOrder(b.day, "SELL", "CLOSE_YESTERDAY", 1, limit_price=D(4000)),
+              IFOrder(b.day, "SELL", "OPEN", 1, limit_price=D(3850))]
+    r = replay_if(CONTRACT, [a, b], orders, initial_cash=D(350000), policy=POLICY)
+    assert [f[2] for f in r.fills] == [a.open, b.open]
+    assert r.rejections == ((2, "PRICE_OUTSIDE_BAND"),)
