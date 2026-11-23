@@ -1,5 +1,6 @@
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal as D
 
 import pytest
@@ -284,3 +285,81 @@ def test_limit_prices_book_the_native_open_for_both_sides():
     r = replay_if(CONTRACT, [a, b], orders, initial_cash=D(350000), policy=POLICY)
     assert [f[2] for f in r.fills] == [a.open, b.open]
     assert r.rejections == ((2, "PRICE_OUTSIDE_BAND"),)
+
+
+def test_observed_opening_quotes_use_independent_sides_and_execution_prices():
+    from engine.index_futures import IFOpeningQuote
+
+    a = market()[0]
+    timestamp = int(datetime(2023, 6, 14, 9, 30, 1, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())*10**9
+    quote = IFOpeningQuote(timestamp, D("4000.0"), D("4000.2"), 2, 1, "controlled-fixture")
+    row = replace(a, opening_quote=quote)
+    orders = [IFOrder(a.day, "BUY", "OPEN", 2, allow_partial=True),
+              IFOrder(a.day, "BUY", "OPEN", 1),
+              IFOrder(a.day, "SELL", "CLOSE_TODAY", 1),
+              IFOrder(a.day, "SELL", "OPEN", 1)]
+    r = replay_if(CONTRACT, [row], orders, initial_cash=D(500000), policy=POLICY,
+                  audit=True, data_snapshot_id="fixture", capacity_model="observed-bbo")
+    assert [f[2] for f in r.fills] == [D("4000.2"), D(4000), D(4000)]
+    assert r.rejections == ((1, "OPEN_CAPACITY"),)
+    assert r.unfilled_lots == {0: 1}
+    assert r.daily[0].position == -1
+    assert r.daily[0].cash == D(496940)
+    assert [o["available_opening_lots"] for o in r.evidence["orders"]] == [1, 0, 2, 1]
+    assert r.evidence["orders"][0]["opening_quote_ts_ns"] == timestamp
+    assert r.evidence["orders"][0]["fill_ts_ns"] == timestamp + 1
+    changed = replay_if(CONTRACT, [replace(row, open=a.open+D(10))], orders,
+                        initial_cash=D(500000), policy=POLICY)
+    assert changed.fills == r.fills and changed.daily == r.daily
+
+
+def test_observed_opening_rejects_stale_and_incomplete_quotes():
+    from engine.index_futures import IFOpeningQuote
+
+    a, b = market()[:2]
+    start = int(datetime(2023, 6, 14, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())*10**9
+    q = IFOpeningQuote(start-1, D(4000), D(4000), 1, 1, "controlled-fixture")
+    with pytest.raises(ValueError, match="opening quote"):
+        replay_if(CONTRACT, [replace(a, opening_quote=q)], [], initial_cash=D(500000), policy=POLICY)
+    with pytest.raises(ValueError, match="complete|aligned"):
+        replay_if(CONTRACT, [replace(a, opening_quote=replace(q, ts_ns=start)), b], [],
+                  initial_cash=D(500000), policy=POLICY)
+
+
+def test_cross_contract_quotes_submit_after_last_quote_with_explicit_age_budget():
+    from engine.index_futures import IFOpeningQuote
+
+    a = market()[0]
+    start = int(datetime(2023, 6, 14, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())*10**9
+    next_month = IFContract("IF2307", CONTRACT.listed, date(2023, 7, 21))
+    q = IFOpeningQuote(start, D(4000), D(4000), 1, 1, "controlled-fixture")
+    rows = {CONTRACT: [replace(a, opening_quote=q)],
+            next_month: [replace(a, opening_quote=replace(q, ts_ns=start+10))]}
+    orders = [(CONTRACT.symbol, IFOrder(a.day, "BUY", "OPEN", 1))]
+    kwargs = dict(initial_cash=D(500000), policy=POLICY, audit=True,
+                  data_snapshot_id="fixture", capacity_model="observed-bbo")
+    with pytest.raises(ValueError, match="age limit"):
+        replay_if_portfolio(rows, orders, **kwargs)
+    r = replay_if_portfolio(rows, orders, max_open_quote_age_ns=10, **kwargs)
+    assert r.evidence["orders"][0]["fill_ts_ns"] == start+11
+
+
+def test_reconcile_external_split_fills_rejects_duplicates_and_surfaces_deltas():
+    from engine.index_futures import IFReferenceFill, compare_opening_fills
+
+    row = market()[0]
+    orders = [IFOrder(row.day, "BUY", "OPEN", 2), IFOrder(row.day, "SELL", "CLOSE_TODAY", 2)]
+    result = replay_if(CONTRACT, [row], orders, initial_cash=D(500000), policy=POLICY, audit=True,
+                       data_snapshot_id="fixture", capacity_model="daily")
+    ts = result.evidence["orders"][0]["fill_ts_ns"]
+    first = IFReferenceFill("one", 0, CONTRACT.symbol, "BUY", ts, 1, row.open)
+    split = replace(first, fill_id="two", ts_ns=ts+2)
+    exit_fill = IFReferenceFill("three", 1, CONTRACT.symbol, "SELL", ts, 2, row.open)
+    accepted = compare_opening_fills(result, [first, split, exit_fill], source="controlled-reference",
+                                     timestamp_tolerance_ns=2)
+    assert accepted.matches and not accepted.differences
+    failed = compare_opening_fills(result, [replace(first, price=row.open+D(".2")), split],
+                                   source="controlled-reference")
+    assert failed.differences == {0: ("PRICE", "TIME"), 1: ("MISSING_REFERENCE_FILL",)}
+    with pytest.raises(ValueError, match="duplicate"):
+        compare_opening_fills(result, [first, first], source="controlled-reference")

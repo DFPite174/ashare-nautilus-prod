@@ -37,6 +37,12 @@ def _positive(value):
     return isinstance(value, D) and value.is_finite() and value > 0
 
 
+def _opening_time(day, rows):
+    if next(iter(rows.values())).opening_quote is None:
+        return _ns(day, 9, 30)
+    return max(row.opening_quote.ts_ns for row in rows.values())
+
+
 def _margin_requirement(notionals, policies, groups):
     gross = ungrouped = D(0)
     sides = {}
@@ -66,6 +72,16 @@ class IFContract:
 
 
 @dataclass(frozen=True)
+class IFOpeningQuote:
+    ts_ns: int
+    bid: D
+    ask: D
+    bid_lots: int
+    ask_lots: int
+    source: str
+
+
+@dataclass(frozen=True)
 class IFDay:
     day: date
     open: D
@@ -74,6 +90,7 @@ class IFDay:
     upper: D
     open_capacity: int  # Available contracts under an explicit opening execution model.
     delivery: D | None = None
+    opening_quote: IFOpeningQuote | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +163,79 @@ class IFResult:
     evidence: Mapping | None = None
 
 
+@dataclass(frozen=True)
+class IFReferenceFill:
+    fill_id: str
+    order_index: int
+    symbol: str
+    side: str
+    ts_ns: int
+    lots: int
+    price: D
+
+
+@dataclass(frozen=True)
+class IFOpeningComparison:
+    source: str
+    reference_sha256: str
+    replay_result_sha256: str
+    timestamp_tolerance_ns: int
+    differences: Mapping[int, tuple[str, ...]]
+
+    @property
+    def matches(self):
+        return not self.differences
+
+
+def compare_opening_fills(result, reference_fills, *, source, timestamp_tolerance_ns=0):
+    """Compare an audited run with a complete, order-indexed external fill extract."""
+    from engine.reproducibility import digest
+
+    if result.evidence is None or not isinstance(source, str) or not source.strip():
+        raise ValueError("Opening comparison requires an audited result and reference source")
+    if type(timestamp_tolerance_ns) is not int or timestamp_tolerance_ns < 0:
+        raise ValueError("Timing tolerance must be a non-negative integer in nanoseconds")
+    orders = result.evidence["orders"]
+    by_order, seen = defaultdict(list), set()
+    for fill in reference_fills:
+        if (not isinstance(fill, IFReferenceFill)
+                or not isinstance(fill.fill_id, str) or not fill.fill_id.strip()
+                or type(fill.order_index) is not int or not 0 <= fill.order_index < len(orders)
+                or type(fill.lots) is not int or fill.lots <= 0 or not _positive(fill.price) or fill.price % TICK
+                or type(fill.ts_ns) is not int or fill.ts_ns <= 0):
+            raise ValueError("Invalid reference fill")
+        if fill.fill_id in seen:
+            raise ValueError(f"Reference contains duplicate fill ID: {fill.fill_id}")
+        order = orders[fill.order_index]
+        if (fill.symbol, fill.side) != (order["symbol"], order["side"]):
+            raise ValueError(f"Reference fill does not identify the replay order: {fill.fill_id}")
+        seen.add(fill.fill_id)
+        by_order[fill.order_index].append(fill)
+    differences = {}
+    for order in orders:
+        index = order["index"]
+        recorded = by_order.get(index, ())
+        lots = order["filled_lots"]
+        if not lots and not recorded:
+            continue
+        if not recorded or not lots:
+            differences[index] = ("MISSING_REFERENCE_FILL" if lots else "MISSING_REPLAY_FILL",)
+            continue
+        total = sum(fill.lots for fill in recorded)
+        reasons = []
+        if lots != total:
+            reasons.append("QUANTITY")
+        if order["fill_price"] * total != sum(fill.price * fill.lots for fill in recorded):
+            reasons.append("PRICE")
+        if any(abs(fill.ts_ns - order["fill_ts_ns"]) > timestamp_tolerance_ns for fill in recorded):
+            reasons.append("TIME")
+        if reasons:
+            differences[index] = tuple(reasons)
+    ordered = sorted((fill for values in by_order.values() for fill in values), key=lambda fill: fill.fill_id)
+    return IFOpeningComparison(source, digest(ordered), result.evidence["result_sha256"],
+                               timestamp_tolerance_ns, MappingProxyType(differences))
+
+
 class _IFReplay(Strategy):
     def __init__(self, instruments, contracts, sessions, orders, order_symbols, cash, policies, overrides,
                  groups, deposits, confirm_before_next, audit):
@@ -176,7 +266,7 @@ class _IFReplay(Strategy):
         for instrument in self.instruments.values():
             self.subscribe_quote_ticks(instrument.id)
         for day, market in self.sessions.items():
-            start = _ns(day, 9, 30)
+            start = _opening_time(day, market)
             self.clock.set_time_alert_ns(f"open-{day}", start + 1,
                                          callback=lambda event, day=day, market=market: self._execute(day, market))
             self.clock.set_time_alert_ns(f"settle-{day}", _ns(day, 15),
@@ -189,37 +279,46 @@ class _IFReplay(Strategy):
         policies = self.overrides[day]
         self.cash += self.deposits.get(day, D(0))
         capacity = {symbol: row.open_capacity for symbol, row in market.items()}
+        observed = next(iter(market.values())).opening_quote is not None
+        side_capacity = ({s: [q.opening_quote.ask_lots, q.opening_quote.bid_lots] for s, q in market.items()}
+                         if observed else None)
         opened = defaultdict(int)
         today, yesterday = self.today.copy(), self.yesterday.copy()
         completed = set()
-        notionals = {s: row.open * self.multipliers[s] for s, row in market.items()}
+        marks = {s: ((row.opening_quote.ask + row.opening_quote.bid) / 2 if observed else row.open)
+                 for s, row in market.items()}
+        notionals = {s: mark * self.multipliers[s] for s, mark in marks.items()}
         projected = self.cash + sum(
-            q * (market[s].open - self.previous_settle[s]) * self.multipliers[s]
+            q * (marks[s] - self.previous_settle[s]) * self.multipliers[s]
             for s, q in yesterday.items() if q)
+        opening_ts = _ns(day, 9, 30)
         for index, symbol, order in self.orders[day]:
             row = market[symbol]
             policy = policies[symbol]
             tick = self.quotes[symbol]
-            if tick.ts_event != _ns(day, 9, 30):
+            if tick.ts_event != (row.opening_quote.ts_ns if observed else opening_ts):
                 raise RuntimeError("Missing current IF opening quote")
             q = yesterday[symbol] + today[symbol]
             sign = 1 if order.side == "BUY" else -1
-            executable = min(order.lots, capacity[symbol]) if order.allow_partial else order.lots
+            sell = sign < 0
+            left = side_capacity[symbol][sell] if observed else capacity[symbol]
+            price = (row.opening_quote.bid if sell else row.opening_quote.ask) if observed else row.open
+            executable = min(order.lots, left) if order.allow_partial else order.lots
             reason = None
             limit = order.limit_price
             if self.capacity_before is not None:
-                self.capacity_before[index] = capacity[symbol]
+                self.capacity_before[index] = left
             if order.depends_on is not None and order.depends_on not in completed:
                 reason = "DEPENDENCY_UNFILLED"
             elif policy.max_order_lots is not None and order.lots > policy.max_order_lots:
                 reason = "ORDER_LIMIT"
             elif limit is not None and not row.lower <= limit <= row.upper:
                 reason = "PRICE_OUTSIDE_BAND"
-            elif limit is not None and sign * (row.open - limit) > 0:
+            elif limit is not None and sign * (price - limit) > 0:
                 reason = "NOT_MARKETABLE"
-            elif (sign > 0 and row.open == row.upper) or (sign < 0 and row.open == row.lower):
+            elif not observed and ((sign > 0 and price == row.upper) or (sign < 0 and price == row.lower)):
                 reason = "LIMIT_LOCK"
-            elif executable == 0 or executable > capacity[symbol]:
+            elif executable == 0 or executable > left:
                 reason = "OPEN_CAPACITY"
             elif order.effect == "OPEN":
                 if q * sign < 0:
@@ -234,7 +333,8 @@ class _IFReplay(Strategy):
                     reason = "INSUFFICIENT_CLOSE_POSITION"
             rate = {"OPEN": policy.open_fee, "CLOSE_TODAY": policy.close_today_fee,
                     "CLOSE_YESTERDAY": policy.close_yesterday_fee}[order.effect]
-            fee = _money(notionals[symbol] * executable * rate)
+            fee = _money(price * self.multipliers[symbol] * executable * rate)
+            execution_cost = sign * executable * (price - marks[symbol]) * self.multipliers[symbol] if observed else D(0)
             if not reason and order.effect == "OPEN":
                 needed = {}
                 for s, amount in notionals.items():
@@ -242,7 +342,7 @@ class _IFReplay(Strategy):
                     if quantity:
                         needed[s] = quantity * amount
                 _, margin = _margin_requirement(needed, policies, self.groups)
-                if projected - fee - policy.submission_fee < margin:
+                if projected - fee - policy.submission_fee - execution_cost < margin:
                     reason = "INSUFFICIENT_MARGIN"
             if reason:
                 self.rejections.append((index, reason))
@@ -250,21 +350,24 @@ class _IFReplay(Strategy):
             native = self.order_factory.limit(
                 instrument_id=tick.instrument_id, order_side=OrderSide.BUY if sign > 0 else OrderSide.SELL,
                 quantity=Quantity.from_int(executable),
-                price=tick.ask_price if limit is None else Price.from_str(format(limit, ".2f")),
+                price=(tick.bid_price if sell else tick.ask_price) if limit is None else Price.from_str(format(limit, ".2f")),
                 time_in_force=TimeInForce.IOC)
             native_id = str(native.client_order_id)
             executed_order = order if executable == order.lots else replace(order, lots=executable)
-            self.submitted[native_id] = (index, symbol, executed_order, fee, row.open)
+            self.submitted[native_id] = (index, symbol, executed_order, fee, price)
             self.submit_order(native)
             if self.confirm_before_next and native_id in self.submitted:
                 raise RuntimeError("Reserved IF order did not fill synchronously in NautilusTrader")
-            capacity[symbol] -= executable
+            if observed:
+                side_capacity[symbol][sell] -= executable
+            else:
+                capacity[symbol] -= executable
             bucket = yesterday if order.effect == "CLOSE_YESTERDAY" else today
             bucket[symbol] += sign * executable
             if order.effect == "OPEN" and policy.max_daily_open_lots is not None:
                 opened[symbol] += executable
             self.submission_fees += policy.submission_fee
-            projected -= fee + policy.submission_fee
+            projected -= fee + policy.submission_fee + execution_cost
             if executable == order.lots:
                 completed.add(index)
             else:
@@ -374,7 +477,7 @@ def _effective_policies(days, policy):
     return policies
 
 
-def _build_evidence(strategy, orders, initial_cash, snapshot, capacity_model):
+def _build_evidence(strategy, orders, initial_cash, snapshot, capacity_model, max_open_quote_age_ns):
     from hashlib import sha256
     from importlib.metadata import version
     from pathlib import Path
@@ -394,6 +497,10 @@ def _build_evidence(strategy, orders, initial_cash, snapshot, capacity_model):
             "allow_partial": order.allow_partial, "filled_lots": filled, "unfilled_lots": order.lots - filled,
             "opening_price": market.open, "opening_band": (market.lower, market.upper),
             "available_opening_lots": strategy.capacity_before[index],
+            "opening_quote_ts_ns": market.opening_quote.ts_ns if market.opening_quote else None,
+            "opening_quote_source": market.opening_quote.source if market.opening_quote else None,
+            "opening_bid": market.opening_quote.bid if market.opening_quote else None,
+            "opening_ask": market.opening_quote.ask if market.opening_quote else None,
             "fill_price": price, "fill_ts_ns": strategy.fill_times.get(index), "trade_fee": fee,
             "submission_fee": strategy.overrides[order.day][symbol].submission_fee if filled else D(0),
             "reason": rejects.get(index),
@@ -402,11 +509,13 @@ def _build_evidence(strategy, orders, initial_cash, snapshot, capacity_model):
         "schema": "cffex-daily-audit-v1", "nautilus_version": version("nautilus-trader"),
         "implementation_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
         "data_snapshot_id": snapshot, "capacity_model": capacity_model,
+        "max_open_quote_age_ns": max_open_quote_age_ns,
         "input_sha256": digest({
             "contracts": strategy.contracts, "sessions": strategy.sessions, "orders": orders,
             "initial_cash": initial_cash, "policy": strategy.policies, "contract_policies": strategy.overrides,
             "margin_groups": strategy.groups, "cash_deposits": strategy.deposits,
             "data_snapshot_id": snapshot, "capacity_model": capacity_model,
+            "max_open_quote_age_ns": max_open_quote_age_ns,
         }),
         "result_sha256": digest({"orders": trace, "daily": strategy.daily}),
         "orders": tuple(trace),
@@ -414,21 +523,24 @@ def _build_evidence(strategy, orders, initial_cash, snapshot, capacity_model):
 
 
 def replay_if(contract, days, orders, *, initial_cash, policy, cash_deposits=None, audit=False,
-              data_snapshot_id=None, capacity_model=None):
+              data_snapshot_id=None, capacity_model=None, max_open_quote_age_ns=0):
     """Replay a single IF contract using the shared futures account."""
     return replay_if_portfolio({contract: days}, ((contract.symbol, order) for order in orders),
                                initial_cash=initial_cash, policy=policy, cash_deposits=cash_deposits,
-                               audit=audit, data_snapshot_id=data_snapshot_id, capacity_model=capacity_model)
+                               audit=audit, data_snapshot_id=data_snapshot_id, capacity_model=capacity_model,
+                               max_open_quote_age_ns=max_open_quote_age_ns)
 
 
 def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_policies=None, trading_days=None,
                         margin_groups=(), cash_deposits=None, audit=False, data_snapshot_id=None,
-                        capacity_model=None):
+                        capacity_model=None, max_open_quote_age_ns=0):
     """Replay (symbol, IFOrder) pairs in input order on each execution date."""
     if not contracts or not _positive(initial_cash) or _money(initial_cash) != initial_cash:
         raise ValueError("Invalid IF contracts or external cash")
     if audit and not all(isinstance(label, str) and label.strip() for label in (data_snapshot_id, capacity_model)):
         raise ValueError("Futures audit requires a data snapshot ID and an opening capacity model")
+    if type(max_open_quote_age_ns) is not int or max_open_quote_age_ns < 0:
+        raise ValueError("Opening quote age limit must be a non-negative integer in nanoseconds")
     by_symbol, market = {}, defaultdict(dict)
     for contract, days in contracts.items():
         if (not re.fullmatch(r"I[FHCM][0-9]{2}(0[1-9]|1[0-2])", contract.symbol)
@@ -447,16 +559,33 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
             if d.delivery is not None and (d.day != contract.expiry or not _positive(d.delivery)
                                            or _money(d.delivery) != d.delivery):
                 raise ValueError("Invalid delivery settlement input")
+            q = d.opening_quote
+            if q is not None and (
+                not isinstance(q, IFOpeningQuote) or type(q.ts_ns) is not int
+                or not _ns(d.day, 9, 30) <= q.ts_ns < _ns(d.day, 9, 31)
+                or not all(_positive(p) and not p % TICK for p in (q.bid, q.ask))
+                or not d.lower <= q.bid <= q.ask <= d.upper
+                or any(type(size) is not int or size < 0 for size in (q.bid_lots, q.ask_lots))
+                or not isinstance(q.source, str) or not q.source.strip()
+            ):
+                raise ValueError(f"Invalid opening quote for {contract.symbol} on {d.day}")
             market[d.day][contract.symbol] = d
             previous = d.day
         if previous is None:
             raise ValueError(f"No sessions for {contract.symbol}")
     market = dict(sorted(market.items()))
+    observed = any(row.opening_quote is not None for rows in market.values() for row in rows.values())
     if trading_days is not None and tuple(trading_days) != tuple(market):
         raise ValueError("Supplied trading calendar differs from futures sessions")
     for day, rows in market.items():
         if any(c.listed <= day <= c.expiry and s not in rows for s, c in by_symbol.items()):
             raise ValueError(f"Missing IF session data on {day}")
+        if observed:
+            if any(row.opening_quote is None for row in rows.values()):
+                raise ValueError(f"Opening quotes must be complete on {day}")
+            observed_times = [row.opening_quote.ts_ns for row in rows.values()]
+            if max(observed_times) - min(observed_times) > max_open_quote_age_ns:
+                raise ValueError(f"Opening quotes are not aligned within the age limit on {day}")
     groups = {}
     for group_id, group in enumerate(margin_groups):
         if isinstance(group, str) or not group:
@@ -510,9 +639,15 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
     for day, rows in market.items():
         ns = _ns(day, 9, 30)
         for symbol, row in rows.items():
-            price = Price.from_str(format(row.open, ".2f"))
-            size = Quantity.from_int(max(row.open_capacity, 1))
-            ticks.append(QuoteTick(instruments[symbol].id, price, price, size, size, ns, ns))
+            quote = row.opening_quote
+            if quote:
+                bid, ask = (Price.from_str(format(px, ".2f")) for px in (quote.bid, quote.ask))
+                bid_size, ask_size = (Quantity.from_int(max(lots, 1)) for lots in (quote.bid_lots, quote.ask_lots))
+                ticks.append(QuoteTick(instruments[symbol].id, bid, ask, bid_size, ask_size, quote.ts_ns, quote.ts_ns))
+            else:
+                price = Price.from_str(format(row.open, ".2f"))
+                size = Quantity.from_int(max(row.open_capacity, 1))
+                ticks.append(QuoteTick(instruments[symbol].id, price, price, size, size, ns, ns))
     engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(log_level="ERROR"), run_analysis=False))
     try:
         # Local IF settlement is authoritative; NT's generic margin account is not a CFFEX ledger.
@@ -534,7 +669,8 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
             raise RuntimeError("Missing NautilusTrader expiry fill")
         evidence = None
         if audit:
-            evidence = _build_evidence(strategy, audited_orders, initial_cash, data_snapshot_id, capacity_model)
+            evidence = _build_evidence(strategy, audited_orders, initial_cash, data_snapshot_id, capacity_model,
+                                       max_open_quote_age_ns)
         return IFResult(tuple(strategy.fills), tuple(strategy.rejections), tuple(strategy.daily),
                         tuple(order_symbols.values()), MappingProxyType(strategy.unfilled_lots), evidence)
     finally:

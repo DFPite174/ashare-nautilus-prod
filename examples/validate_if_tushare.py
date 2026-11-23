@@ -1,16 +1,18 @@
 """Verify opening, rolls and expiry against the local Tushare lake and a CFFEX notice."""
 import argparse
-from datetime import date
+from datetime import date, datetime
 from dataclasses import replace
 from decimal import Decimal as D, ROUND_HALF_UP
 from hashlib import file_digest, sha256
 from pathlib import Path
 import sys
+from zoneinfo import ZoneInfo
 
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from engine.index_futures import IFContract, IFDay, IFOrder, IFPolicy, replay_if, replay_if_portfolio
+from engine.index_futures import (IFContract, IFDay, IFOpeningQuote, IFOrder, IFPolicy, IFReferenceFill,
+                                  compare_opening_fills, replay_if, replay_if_portfolio)
 
 # CFFEX notice 中金所发〔2023〕39号, cross-checked against local expiry settlements.
 DELIVERY = {"IF2306": D("3957.67"), "IH2306": D("2596.87"),
@@ -142,6 +144,27 @@ def validate_risk_audit(lake):
     assert result.daily[-1].submission_fees == D(1)
     print("IM opening risk and audit", result.rejections, result.daily[-1].position,
           result.evidence["input_sha256"], result.evidence["result_sha256"])
+
+    # Controlled depth on the real Tushare opening price. External reference
+    # fills below are calculated from the setup, independently of the engine.
+    ts = int(datetime.combine(day.day, datetime.min.time(), ZoneInfo("Asia/Shanghai")).timestamp()
+             + 9 * 3600 + 30 * 60 + 1) * 10**9
+    quote = IFOpeningQuote(ts, day.open, day.open + D(".2"), 2, 1, "controlled-tushare-depth")
+    observed_day = replace(day, opening_quote=quote)
+    tape = [IFOrder(day.day, "BUY", "OPEN", 2, allow_partial=True),
+            IFOrder(day.day, "SELL", "CLOSE_TODAY", 1)]
+    observed = replay_if(contract, [observed_day], tape, **dict(options, capacity_model="controlled-bbo"))
+    expectation = [
+        IFReferenceFill("buy", 0, contract.symbol, "BUY", ts + 1, 1, quote.ask),
+        IFReferenceFill("sell", 1, contract.symbol, "SELL", ts + 1, 1, quote.bid),
+    ]
+    comparison = compare_opening_fills(observed, expectation, source="independent-controlled-expectation")
+    assert comparison.matches and observed.unfilled_lots == {0: 1}
+    varied = compare_opening_fills(observed, [replace(expectation[0], ts_ns=ts+2), expectation[1]],
+                                   source="injected-timestamp-difference")
+    assert varied.differences == {0: ("TIME",)}
+    print("opening quote reconciliation", observed.unfilled_lots, observed.daily[-1].cash,
+          comparison.matches, dict(varied.differences))
 
 
 def validate_equity_overlay(root, contract, days, policy):
