@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from engine.index_futures import (IFContract, IFDay, IFOpeningQuote, IFOrder, IFPolicy, IFReferenceFill,
-                                  compare_opening_fills, replay_if, replay_if_portfolio)
+                                  IFReferenceOrder, compare_opening_fills, replay_if, replay_if_portfolio)
 
 # CFFEX notice 中金所发〔2023〕39号, cross-checked against local expiry settlements.
 DELIVERY = {"IF2306": D("3957.67"), "IH2306": D("2596.87"),
@@ -152,19 +152,34 @@ def validate_risk_audit(lake):
     quote = IFOpeningQuote(ts, day.open, day.open + D(".2"), 2, 1, "controlled-tushare-depth")
     observed_day = replace(day, opening_quote=quote)
     tape = [IFOrder(day.day, "BUY", "OPEN", 2, allow_partial=True),
-            IFOrder(day.day, "SELL", "CLOSE_TODAY", 1)]
+            IFOrder(day.day, "SELL", "CLOSE_TODAY", 1),
+            IFOrder(day.day, "BUY", "OPEN", 1, limit_price=quote.bid)]
     observed = replay_if(contract, [observed_day], tape, **dict(options, capacity_model="controlled-bbo"))
     expectation = [
-        IFReferenceFill("buy", 0, contract.symbol, "BUY", ts + 1, 1, quote.ask),
-        IFReferenceFill("sell", 1, contract.symbol, "SELL", ts + 1, 1, quote.bid),
+        IFReferenceFill("buy-fill", 0, contract.symbol, "BUY", ts + 1, 1, quote.ask, "buy"),
+        IFReferenceFill("sell-fill", 1, contract.symbol, "SELL", ts + 1, 1, quote.bid, "sell"),
     ]
-    comparison = compare_opening_fills(observed, expectation, source="independent-controlled-expectation")
-    assert comparison.matches and observed.unfilled_lots == {0: 1}
+    cents = lambda v: v.quantize(D(".01"), rounding=ROUND_HALF_UP)
+    terminal = [
+        IFReferenceOrder(0, "buy", day.day, contract.symbol, "BUY", "OPEN", 2, 1, "CANCELLED",
+                         trade_fee=cents(quote.ask * 200 * policy.open_fee), submission_fee=D(1)),
+        IFReferenceOrder(1, "sell", day.day, contract.symbol, "SELL", "CLOSE_TODAY", 1, 1, "FILLED",
+                         trade_fee=cents(quote.bid * 200 * policy.close_today_fee), submission_fee=D(1)),
+        IFReferenceOrder(2, "no-fill", day.day, contract.symbol, "BUY", "OPEN", 1, 0, "EXPIRED",
+                         limit_price=quote.bid, trade_fee=D(0), submission_fee=D(0)),
+    ]
+    comparison = compare_opening_fills(observed, expectation, source="independent-controlled-expectation",
+                                       reference_orders=terminal)
+    assert comparison.accepted and observed.unfilled_lots == {0: 1}
     varied = compare_opening_fills(observed, [replace(expectation[0], ts_ns=ts+2), expectation[1]],
-                                   source="injected-timestamp-difference")
+                                   source="injected-timestamp-difference", reference_orders=terminal)
     assert varied.differences == {0: ("TIME",)}
+    incomplete = compare_opening_fills(observed, expectation, source="injected-missing-terminal-order",
+                                       reference_orders=terminal[:2])
+    assert not incomplete.accepted and incomplete.differences == {2: ("UNCOVERED_ORDER",)}
     print("opening quote reconciliation", observed.unfilled_lots, observed.daily[-1].cash,
-          comparison.matches, dict(varied.differences))
+          comparison.accepted, comparison.reference_orders_covered,
+          dict(varied.differences), dict(incomplete.differences))
 
 
 def validate_equity_overlay(root, contract, days, policy):

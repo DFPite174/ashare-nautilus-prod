@@ -172,6 +172,23 @@ class IFReferenceFill:
     ts_ns: int
     lots: int
     price: D
+    broker_order_id: str | None = None
+
+
+@dataclass(frozen=True)
+class IFReferenceOrder:
+    order_index: int
+    broker_order_id: str
+    day: date
+    symbol: str
+    side: str
+    effect: str
+    requested_lots: int
+    filled_lots: int
+    status: str
+    limit_price: D | None = None
+    trade_fee: D | None = None
+    submission_fee: D | None = None
 
 
 @dataclass(frozen=True)
@@ -181,14 +198,58 @@ class IFOpeningComparison:
     replay_result_sha256: str
     timestamp_tolerance_ns: int
     differences: Mapping[int, tuple[str, ...]]
+    reference_complete: bool = False
+    reference_orders_covered: int = 0
+    replay_orders: int = 0
 
     @property
     def matches(self):
         return not self.differences
 
+    @property
+    def accepted(self):
+        return self.reference_complete and self.matches
 
-def compare_opening_fills(result, reference_fills, *, source, timestamp_tolerance_ns=0):
-    """Compare an audited run with a complete, order-indexed external fill extract."""
+
+def _reference_order_map(reference_orders, replay_orders):
+    terminal, broker_ids = {}, set()
+    for row in reference_orders:
+        if (not isinstance(row, IFReferenceOrder)
+                or type(row.order_index) is not int or not 0 <= row.order_index < len(replay_orders)
+                or not isinstance(row.broker_order_id, str) or not row.broker_order_id.strip()
+                or type(row.day) is not date or type(row.requested_lots) is not int
+                or type(row.filled_lots) is not int or not 0 <= row.filled_lots <= row.requested_lots):
+            raise ValueError("Invalid reference terminal order")
+        index = row.order_index
+        if row.status == "FILLED":
+            valid_status = row.filled_lots == row.requested_lots and row.requested_lots > 0
+        elif row.status in ("CANCELLED", "EXPIRED"):
+            valid_status = row.filled_lots < row.requested_lots
+        else:
+            valid_status = row.status == "REJECTED" and row.filled_lots == 0
+        if not valid_status:
+            raise ValueError(f"Reference order {index} has invalid terminal status or quantity")
+        if row.limit_price is not None and (not _positive(row.limit_price) or row.limit_price % TICK):
+            raise ValueError(f"Invalid reference order limit price for order {index}")
+        broker_key = (row.day, row.broker_order_id)
+        if index in terminal or broker_key in broker_ids:
+            raise ValueError("Reference contains duplicate terminal order or broker order ID")
+        replay = replay_orders[index]
+        if (row.day, row.symbol, row.side, row.effect, row.requested_lots, row.limit_price) != (
+            replay["day"], replay["symbol"], replay["side"], replay["effect"], replay["requested_lots"],
+            replay["limit_price"],
+        ):
+            raise ValueError(f"Reference terminal order does not identify replay order {index}")
+        if any(fee is not None and (not isinstance(fee, D) or not fee.is_finite() or fee < 0 or _money(fee) != fee)
+               for fee in (row.trade_fee, row.submission_fee)):
+            raise ValueError(f"Invalid reference fees for order {index}")
+        terminal[index] = row
+        broker_ids.add(broker_key)
+    return terminal
+
+
+def compare_opening_fills(result, reference_fills, *, source, timestamp_tolerance_ns=0, reference_orders=None):
+    """Reconcile external fills. Terminal orders provide coverage for formal acceptance."""
     from engine.reproducibility import digest
 
     if result.evidence is None or not isinstance(source, str) or not source.strip():
@@ -196,6 +257,7 @@ def compare_opening_fills(result, reference_fills, *, source, timestamp_toleranc
     if type(timestamp_tolerance_ns) is not int or timestamp_tolerance_ns < 0:
         raise ValueError("Timing tolerance must be a non-negative integer in nanoseconds")
     orders = result.evidence["orders"]
+    terminal = None if reference_orders is None else _reference_order_map(reference_orders, orders)
     by_order, seen = defaultdict(list), set()
     for fill in reference_fills:
         if (not isinstance(fill, IFReferenceFill)
@@ -209,6 +271,10 @@ def compare_opening_fills(result, reference_fills, *, source, timestamp_toleranc
         order = orders[fill.order_index]
         if (fill.symbol, fill.side) != (order["symbol"], order["side"]):
             raise ValueError(f"Reference fill does not identify the replay order: {fill.fill_id}")
+        if terminal is not None:
+            reference_order = terminal.get(fill.order_index)
+            if reference_order is None or fill.broker_order_id != reference_order.broker_order_id:
+                raise ValueError(f"Reference fill has no matching broker order: {fill.fill_id}")
         seen.add(fill.fill_id)
         by_order[fill.order_index].append(fill)
     differences = {}
@@ -216,24 +282,38 @@ def compare_opening_fills(result, reference_fills, *, source, timestamp_toleranc
         index = order["index"]
         recorded = by_order.get(index, ())
         lots = order["filled_lots"]
-        if not lots and not recorded:
-            continue
-        if not recorded or not lots:
-            differences[index] = ("MISSING_REFERENCE_FILL" if lots else "MISSING_REPLAY_FILL",)
-            continue
         total = sum(fill.lots for fill in recorded)
         reasons = []
-        if lots != total:
-            reasons.append("QUANTITY")
-        if order["fill_price"] * total != sum(fill.price * fill.lots for fill in recorded):
-            reasons.append("PRICE")
-        if any(abs(fill.ts_ns - order["fill_ts_ns"]) > timestamp_tolerance_ns for fill in recorded):
-            reasons.append("TIME")
+        if terminal is not None:
+            reference_order = terminal.get(index)
+            if reference_order is None:
+                differences[index] = ("UNCOVERED_ORDER",)
+                continue
+            if total != reference_order.filled_lots:
+                raise ValueError(f"Reference terminal quantity disagrees with fills for order {index}")
+            if reference_order.trade_fee is not None and reference_order.trade_fee != order["trade_fee"]:
+                reasons.append("TRADE_FEE")
+            if reference_order.submission_fee is not None and reference_order.submission_fee != order["submission_fee"]:
+                reasons.append("SUBMISSION_FEE")
+        if lots and recorded:
+            if lots != total:
+                reasons.append("QUANTITY")
+            if order["fill_price"] * total != sum(fill.price * fill.lots for fill in recorded):
+                reasons.append("PRICE")
+            elif any(fill.price != order["fill_price"] for fill in recorded):
+                reasons.append("PRICE_DISTRIBUTION")
+            if any(abs(fill.ts_ns - order["fill_ts_ns"]) > timestamp_tolerance_ns for fill in recorded):
+                reasons.append("TIME")
+        elif lots or recorded:
+            reasons.append("MISSING_REFERENCE_FILL" if lots else "MISSING_REPLAY_FILL")
         if reasons:
             differences[index] = tuple(reasons)
     ordered = sorted((fill for values in by_order.values() for fill in values), key=lambda fill: fill.fill_id)
-    return IFOpeningComparison(source, digest(ordered), result.evidence["result_sha256"],
-                               timestamp_tolerance_ns, MappingProxyType(differences))
+    covered = len(terminal) if terminal is not None else 0
+    reference_digest = digest(ordered if terminal is None else {"fills": ordered, "terminal_orders": terminal})
+    return IFOpeningComparison(source, reference_digest, result.evidence["result_sha256"],
+                               timestamp_tolerance_ns, MappingProxyType(differences),
+                               terminal is not None and covered == len(orders), covered, len(orders))
 
 
 class _IFReplay(Strategy):

@@ -363,3 +363,45 @@ def test_reconcile_external_split_fills_rejects_duplicates_and_surfaces_deltas()
     assert failed.differences == {0: ("PRICE", "TIME"), 1: ("MISSING_REFERENCE_FILL",)}
     with pytest.raises(ValueError, match="duplicate"):
         compare_opening_fills(result, [first, first], source="controlled-reference")
+
+
+def test_strict_opening_comparison_detects_offsetting_prices_and_missing_zero_fill_order():
+    from engine.index_futures import IFReferenceFill, IFReferenceOrder, compare_opening_fills
+
+    row = market()[0]
+    orders = [IFOrder(row.day, "BUY", "OPEN", 2),
+              IFOrder(row.day, "BUY", "OPEN", 1, limit_price=row.open-D(".2"))]
+    result = replay_if(CONTRACT, [row], orders, initial_cash=D(500000), policy=POLICY, audit=True,
+                       data_snapshot_id="fixture", capacity_model="daily")
+    ts = result.evidence["orders"][0]["fill_ts_ns"]
+    one = IFReferenceFill("fill-1", 0, CONTRACT.symbol, "BUY", ts, 1, row.open, broker_order_id="order-1")
+    two = replace(one, fill_id="fill-2")
+    first = IFReferenceOrder(0, "order-1", row.day, CONTRACT.symbol, "BUY", "OPEN", 2, 2, "FILLED")
+    second = IFReferenceOrder(1, "order-2", row.day, CONTRACT.symbol, "BUY", "OPEN", 1, 0, "EXPIRED",
+                              limit_price=orders[1].limit_price)
+    diagnostic = compare_opening_fills(result, [one, two], source="fixture")
+    assert diagnostic.matches and not diagnostic.accepted
+    incomplete = compare_opening_fills(result, [one, two], source="fixture", reference_orders=[first])
+    assert incomplete.differences == {1: ("UNCOVERED_ORDER",)} and not incomplete.accepted
+    strict = compare_opening_fills(result, [one, two], source="fixture", reference_orders=[first, second])
+    assert strict.accepted and strict.reference_orders_covered == 2
+    offset = compare_opening_fills(
+        result, [replace(one, price=row.open-D(".2")), replace(two, price=row.open+D(".2"))],
+        source="fixture", reference_orders=[first, second],
+    )
+    assert offset.differences == {0: ("PRICE_DISTRIBUTION",)} and not offset.accepted
+    assert offset.reference_sha256 != strict.reference_sha256
+    with pytest.raises(ValueError, match="terminal quantity"):
+        compare_opening_fills(result, [one], source="fixture", reference_orders=[first, second])
+    with pytest.raises(ValueError, match="broker order"):
+        compare_opening_fills(result, [replace(one, broker_order_id="wrong"), two], source="fixture",
+                              reference_orders=[first, second])
+    wrong_fee = compare_opening_fills(result, [one, two], source="fixture",
+                                     reference_orders=[first, replace(second, submission_fee=D(1))])
+    assert wrong_fee.differences == {1: ("SUBMISSION_FEE",)}
+    with pytest.raises(ValueError, match="does not identify"):
+        compare_opening_fills(result, [one, two], source="fixture",
+                              reference_orders=[replace(first, effect="CLOSE_TODAY"), second])
+    with pytest.raises(ValueError, match="terminal status"):
+        compare_opening_fills(result, [one, two], source="fixture",
+                              reference_orders=[first, replace(second, status="WORKING")])

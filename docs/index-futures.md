@@ -21,7 +21,9 @@
 
 **开盘后盘口回放。** 在 `IFDay.opening_quote` 提供 `IFOpeningQuote(ts_ns, bid, ask, bid_lots, ask_lots, source)`，使用北京时间 09:30 至 09:31 前已经可见的买一卖一快照。买单消耗卖一，卖单消耗买一，零深度对应零容量。全部合约收到快照后才执行订单，默认要求时间对齐，异步数据可显式提供 `max_open_quote_age_ns`。同次回放每个合约日均须提供快照。开盘后资金以买卖中间价估值，同时计入成交价差、手续费和申报费。盘口模式使用同批静态快照，适合评估开盘后立即成交，集合竞价排队和随后盘口变化需要独立数据与模型。
 
-**外部成交对账。** `compare_opening_fills(result, reference_fills, source=..., timestamp_tolerance_ns=...)` 接收覆盖全部委托的独立成交明细。调用方先将经纪商委托号映射到回放委托索引，提供唯一成交号、标的、方向、手数、成交价和事件时间。分笔成交按委托汇总手数与加权价，每笔时间分别核对。输出区分缺失成交、数量、价格和时间差异，并保留参考和回放指纹。示例将真实 Tushare 日线价格与可控盘口、独立预期组合使用。
+**外部成交对账。** 使用 `compare_opening_fills(result, reference_fills, source=..., timestamp_tolerance_ns=...)` 诊断成交差异。分笔成交按委托比较总手数与加权价，同时核对每笔时间和价格。即使均价相同，偏离回放价的分笔也报告 `PRICE_DISTRIBUTION`。
+
+**正式验收。** 另传 `reference_orders`，为每笔委托提供经纪商委托号、交易日、合约、方向、开平标志、原始手数、限价、终态和最终成交手数。终态支持 `FILLED`、`CANCELLED`、`EXPIRED`、`REJECTED`。成交明细须通过同一个经纪商委托号关联，且汇总手数与终态一致。可选的 `trade_fee` 与 `submission_fee` 单独对账。每笔委托均有终态、包括零成交，且无差异时 `accepted` 为真。只提供成交明细时，`matches` 可用于诊断。示例使用真实 Tushare 开盘价、受控盘口和独立算出的参考成交，检验完整验收和缺失终态的处理。
 
 **日终账户。** 现金反映结算盈亏、费用和外部补资。可用资金等于现金减占用保证金。`gross_margin` 单列无抵扣的保证金，`margin_shortfall` 记录资金缺口，主动减仓仍可执行。名义敞口以结算价计量，带多空符号，交割后归零。
 
