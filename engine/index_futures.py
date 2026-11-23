@@ -3,7 +3,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from decimal import Decimal as D, ROUND_HALF_UP
 import re
 from zoneinfo import ZoneInfo
@@ -127,6 +127,7 @@ class _IFReplay(Strategy):
         self.previous_settle = {}
         self.fills, self.rejections, self.daily = [], [], []
         self.submitted = {}
+        self.pending_delivery = {}
         self.fill_offset = 0
         self.symbols = {v.id: k for k, v in instruments.items()}
         self.quotes = {}
@@ -195,7 +196,16 @@ class _IFReplay(Strategy):
             projected -= fee
 
     def on_order_filled(self, event):
-        index, symbol, order, fee, price = self.submitted.pop(str(event.client_order_id))
+        order_id = str(event.client_order_id)
+        if order_id.startswith("EXPIRATION-LEG-"):
+            symbol = self.symbols[event.instrument_id]
+            expected = self.pending_delivery.pop(symbol, None)
+            side = 1 if event.order_side == OrderSide.BUY else -1
+            actual = (event.ts_event, side * int(event.last_qty), D(str(event.last_px)))
+            if actual != expected:
+                raise RuntimeError("Native expiry differs from CFFEX cash delivery")
+            return
+        index, symbol, order, fee, price = self.submitted.pop(order_id)
         if D(str(event.last_px)) != price or int(event.last_qty) != order.lots:
             raise RuntimeError("Native fill differs from reserved opening execution")
         lots = order.lots if order.side == "BUY" else -order.lots
@@ -231,6 +241,7 @@ class _IFReplay(Strategy):
                        for order, price in fills[symbol])
             variation += _money(pnl * multiplier)
             if delivered:
+                self.pending_delivery[symbol] = (_ns(day, 15) + 1, -delivered, settle)
                 fees += _money(abs(delivered) * settle * multiplier * policy.delivery_fee)
                 position = 0
             positions[symbol] = position
@@ -303,7 +314,8 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
                     or any(p % TICK for p in (d.open, d.lower, d.upper))
                     or type(d.open_capacity) is not int or d.open_capacity < 0):
                 raise ValueError(f"Invalid or unordered IF session: {d.day}")
-            if d.delivery is not None and (d.day != contract.expiry or not _positive(d.delivery)):
+            if d.delivery is not None and (d.day != contract.expiry or not _positive(d.delivery)
+                                           or _money(d.delivery) != d.delivery):
                 raise ValueError("Invalid delivery settlement input")
             market[d.day][contract.symbol] = d
             previous = d.day
@@ -335,31 +347,35 @@ def replay_if_portfolio(contracts, orders, *, initial_cash, policy, contract_pol
     venue = Venue("CFFEX")
     instruments = {
         s: FuturesContract(InstrumentId(Symbol(s), venue), Symbol(s), AssetClass.INDEX,
-                           CNY, 1, Price.from_str("0.2"), Quantity.from_int(c.multiplier),
+                           CNY, 2, Price.from_str("0.20"), Quantity.from_int(c.multiplier),
                            Quantity.from_int(1), PRODUCTS[s[:2]][1],
-                           _ns(c.listed, 0), _ns(c.expiry + timedelta(days=1), 0), 0, 0)
+                           _ns(c.listed, 0), _ns(c.expiry, 15) + 1, 0, 0)
         for s, c in by_symbol.items()
     }
     ticks = []
     for day, rows in market.items():
         ns = _ns(day, 9, 30)
         for symbol, row in rows.items():
-            price = Price.from_str(format(row.open, ".1f"))
+            price = Price.from_str(format(row.open, ".2f"))
             size = Quantity.from_int(max(row.open_capacity, 1))
             ticks.append(QuoteTick(instruments[symbol].id, price, price, size, size, ns, ns))
     engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(log_level="ERROR"), run_analysis=False))
     try:
         # Local IF settlement is authoritative; NT's generic margin account is not a CFFEX ledger.
+        delivery_prices = {instruments[s].id: float(row.delivery) for rows in market.values()
+                           for s, row in rows.items() if row.delivery is not None}
         engine.add_venue(venue, OmsType.NETTING, AccountType.MARGIN, [Money(initial_cash, CNY)],
-                         base_currency=CNY, frozen_account=True)
+                         base_currency=CNY, frozen_account=True, settlement_prices=delivery_prices)
         for instrument in instruments.values():
             engine.add_instrument(instrument)
         strategy = _IFReplay(instruments, by_symbol, market, by_day, order_symbols, initial_cash, policies, overrides)
         engine.add_strategy(strategy)
         engine.add_data(ticks)
-        engine.run(end=_ns(max(market), 15) + 1)
+        engine.run(end=_ns(max(market), 15) + 2)
         if len(strategy.daily) != len(market):
             raise RuntimeError("Missing daily IF settlement")
+        if strategy.pending_delivery:
+            raise RuntimeError("Missing NautilusTrader expiry fill")
         return IFResult(tuple(strategy.fills), tuple(strategy.rejections), tuple(strategy.daily), tuple(order_symbols.values()))
     finally:
         engine.dispose()

@@ -37,6 +37,24 @@ def test_cash_delivery_and_missing_delivery():
     assert r.daily[-1].delivered_position == -1
 
 
+@pytest.mark.parametrize("opening,sign", [("BUY", 1), ("SELL", -1)])
+def test_expiry_uses_official_price_once_when_another_contract_keeps_trading(opening, sign):
+    following = DAYS[-1] + timedelta(days=3)
+    next_month = IFContract("IF2307", CONTRACT.listed, date(2023, 7, 21))
+    next_day = IFDay(following, D(4000), D(4002), D(3900), D(4100), 100)
+    orders = [(CONTRACT.symbol, IFOrder(DAYS[0], opening, "OPEN", 1)),
+              (next_month.symbol, IFOrder(following, "BUY", "OPEN", 1))]
+    result = replay_if_portfolio({CONTRACT: market(D("3999.99")), next_month: market()+[next_day]},
+                                 orders, initial_cash=D(250000), policy=POLICY)
+    assert not result.rejections and len(result.fills) == 2
+    expiry, afterward = result.daily[-2:]
+    assert expiry.cash == D(250000) - 3*sign
+    assert expiry.deliveries[CONTRACT.symbol] == sign and expiry.margin == 0
+    assert afterward.cash == expiry.cash + 600
+    assert afterward.positions == {CONTRACT.symbol: 0, next_month.symbol: 1}
+    assert afterward.deliveries == {CONTRACT.symbol: 0, next_month.symbol: 0}
+
+
 def test_margin_and_zero_capacity_reject():
     order = IFOrder(DAYS[0], "BUY", "OPEN", 1)
     r = replay_if(CONTRACT, market()[:1], [order], initial_cash=D(10000), policy=POLICY)
