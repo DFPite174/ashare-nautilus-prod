@@ -114,6 +114,7 @@ class BacktestResult:
             if isinstance(x, Decimal): return str(x)
             if isinstance(x, dict): return {str(k): convert(v) for k,v in x.items()}
             if isinstance(x, (list,tuple)): return [convert(v) for v in x]
+            if type(x) not in (int, float, str, bool, type(None)): return str(x)
             return x
         return convert(asdict(self))
 
