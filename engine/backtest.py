@@ -362,7 +362,7 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
                         sym_clean = b.symbol.split('.')[0]
                         if sym_clean.startswith(('60', '00')):
                             statutory_bound = D('0.88')
-                        elif sym_clean.startswith(('30', '688')):
+                        elif sym_clean.startswith(('30', '688', '689')):
                             statutory_bound = D('0.78')
                         else:
                             statutory_bound = D('0.68')
@@ -398,12 +398,13 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
 
 
 class _ResearchStrategy(Strategy):
-    def __init__(self, bars, rules, master, sessions, actions, signal, initial_cash, rate, native, fee_model, cash_module, liquidity, portfolio_signal=None, frozen_orders=None, cash_exhaustion_policy='reject'):
+    def __init__(self, bars, rules, master, sessions, actions, signal, initial_cash, rate, native, fee_model, cash_module, liquidity, portfolio_signal=None, frozen_orders=None, cash_exhaustion_policy='reject', participation_policy='reject'):
         super().__init__(StrategyConfig())
         self.bars=bars;self.rules=rules;self.master=master;self.sessions=sessions;self.actions=actions
         self.signal=signal;self.rate=rate;self.native=native;self.fee_model=fee_model;self.cash_module=cash_module
         self.liquidity=liquidity
         self.cash_exhaustion_policy=cash_exhaustion_policy
+        self.participation_policy=participation_policy
         self.buy_reservations={}
         self.trimmed_intents = []
         self.failed_sell_symbols = set()
@@ -662,11 +663,33 @@ class _ResearchStrategy(Strategy):
         for created,intent in self.pending:
             if intent.symbol!=symbol or created>tick.ts_event or intent.side.upper()!=phase:
                 remaining.append((created,intent));continue
+            rule=self.rules[(symbol,day)]
             side=OrderSide.BUY if intent.side.upper()=='BUY' else OrderSide.SELL
             price=tick.ask_price if side==OrderSide.BUY else tick.bid_price
-            if intent.limit_price is None:price=self.liquidity.execution_price(price,side,self.native[symbol])
+            if intent.limit_price is None:
+                dn,up=(rule.get('down_limit'),rule.get('up_limit')) if rule.get('limit_state')=='BOUNDED' else (None,None)
+                price=self.liquidity.execution_price(price,side,self.native[symbol],down_limit=dn,up_limit=up)
             if intent.quantity>available:
-                self._reject_intent(intent,'PARTICIPATION_LIMIT',tick.ts_init,price=price);continue
+                if self.participation_policy=='clip':
+                    step=rule.get('buy_step',100) if side==OrderSide.BUY else rule.get('sell_step',100)
+                    min_lot=rule.get('buy_min',100) if side==OrderSide.BUY else rule.get('sell_min',100)
+                    clipped=min_lot+((available-min_lot)//step)*step if available>=min_lot else 0
+                    if clipped<min_lot:
+                        self._reject_intent(intent,'PARTICIPATION_LIMIT',tick.ts_init,price=price);continue
+                    from engine.intents import OrderIntent
+                    ref_px=D(str(price)) if intent.limit_price is None else D(str(intent.limit_price))
+                    self.trimmed_intents.append(TrimmedIntentRecord(
+                        intent_id=intent.intent_id,
+                        symbol=symbol,
+                        planned_quantity=intent.quantity,
+                        submitted_quantity=clipped,
+                        trimmed_quantity=intent.quantity-clipped,
+                        reference_price=ref_px,
+                        timestamp=tick.ts_init,
+                    ))
+                    intent=OrderIntent(symbol=intent.symbol,side=intent.side,quantity=clipped,limit_price=intent.limit_price,intent_id=intent.intent_id,earliest_execution=intent.earliest_execution)
+                else:
+                    self._reject_intent(intent,'PARTICIPATION_LIMIT',tick.ts_init,price=price);continue
             # IOC at the observed open avoids NT market-order empty-book fallback.
             args=dict(instrument_id=tick.instrument_id,order_side=side,quantity=Quantity.from_int(intent.quantity),time_in_force=TimeInForce.IOC if intent.limit_price is None else TimeInForce.DAY)
             order=self.order_factory.limit(**args,price=price if intent.limit_price is None else Price.from_str(format(intent.limit_price,f".{self.precisions[symbol]}f")))
@@ -676,7 +699,6 @@ class _ResearchStrategy(Strategy):
                 avail_cash=self.ledger.cash-sum((r['amount'] for r in self.buy_reservations.values()),D(0))
                 if cost>avail_cash:
                     if self.cash_exhaustion_policy=='auto_trim':
-                        rule=self.rules.get((symbol,day),{})
                         step=rule.get('buy_step',100)
                         min_lot=rule.get('buy_min',100)
                         affordable_qty=self._calculate_affordable_lots(symbol,D(str(order.price)),intent.quantity,avail_cash,step,min_lot,day)
@@ -703,7 +725,9 @@ class _ResearchStrategy(Strategy):
                     else:
                         self._reject_intent(intent,'INSUFFICIENT_CASH_WITH_FEES',tick.ts_init,price=order.price);continue
             self.order_sides[str(order.client_order_id)] = side.name
-            r=self.gateway.validate_and_reserve(order,self.rules[(symbol,day)],{'close':tick.ask_price.as_double(),'volume':max(available,1),'execution_ts':tick.ts_init},tick.ask_price.as_double() if side==OrderSide.BUY else tick.bid_price.as_double())
+            open_ns=nanos(at(day,9,30))
+            is_preopen_order=created<open_ns and tick.ts_event==open_ns
+            r=self.gateway.validate_and_reserve(order,rule,{'close':tick.ask_price.as_double(),'volume':max(available,1),'execution_ts':tick.ts_init},tick.ask_price.as_double() if side==OrderSide.BUY else tick.bid_price.as_double(),enforce_collar=False if is_preopen_order else None)
             if r.is_valid:
                 self._sync_account_symbol(symbol)
                 if side==OrderSide.BUY:self.buy_reservations[str(order.client_order_id)]={'amount':cost,'quantity':D(intent.quantity),'price':D(str(order.price))}
@@ -848,12 +872,13 @@ class _ResearchStrategy(Strategy):
         self.nav.append(row);self.closed.add(day)
 
 
-def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy=None, _prepared=None, _tape=None):
+def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', frozen_orders=None, execution_mode='synthetic_l2', cash_exhaustion_policy='reject', participation_policy='reject', corporate_action_gate_policy=None, unresolved_entitlements=(), _prepared=None, _tape=None):
     """Run one isolated, shared-cash portfolio. Rules keyed by (symbol, local date)."""
     VALID_GATE_POLICIES = {"strict", "warn"}
     VALID_EXEC_MODES = {"synthetic_l2", "auction_open"}
     VALID_DATA_MODES = {"full", "session", "sparse", "orders"}
     VALID_CASH_POLICIES = {"reject", "auto_trim"}
+    VALID_PARTICIPATION_POLICIES = {"reject", "clip"}
 
     if corporate_action_gate_policy is None:
         corporate_action_gate_policy = _prepared.corporate_action_gate_policy if _prepared is not None else 'strict'
@@ -867,6 +892,8 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         raise ValueError(f"Invalid data_mode: {data_mode}")
     if cash_exhaustion_policy not in VALID_CASH_POLICIES:
         raise ValueError(f"Invalid cash_exhaustion_policy: {cash_exhaustion_policy}")
+    if participation_policy not in VALID_PARTICIPATION_POLICIES:
+        raise ValueError(f"Invalid participation_policy: {participation_policy}")
 
     if actions is not None and not corporate_actions:
         corporate_actions = actions
@@ -916,6 +943,8 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         corporate_action_gate_policy=corporate_action_gate_policy)
     if anomalies:
         manifest['data_anomalies'] = anomalies
+    if participation_policy != 'reject':
+        manifest['participation_policy'] = participation_policy
     liquidity=BarLiquidity(slippage_bps)
     # Complete research history lives in our immutable callback snapshots.
     eng=BacktestEngine(config=BacktestEngineConfig(
@@ -931,10 +960,10 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
             native[symbol]=Equity(instrument_id=InstrumentId(Symbol(symbol),SIM),raw_symbol=Symbol(symbol.split('.')[0]),currency=CNY,price_precision=prec,price_increment=Price.from_str(inc_str),lot_size=Quantity.from_int(i.lot_size),ts_event=nanos(at(sessions[0],0)),ts_init=nanos(at(sessions[0],0)))
             eng.add_instrument(native[symbol])
         if _tape is None:
-            strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal,frozen_orders=frozen_orders,cash_exhaustion_policy=cash_exhaustion_policy)
+            strategy=_ResearchStrategy(bars,rules,master,sessions,actions,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity,portfolio_signal,frozen_orders=frozen_orders,cash_exhaustion_policy=cash_exhaustion_policy,participation_policy=participation_policy)
         else:
             from engine.tape_replay import _TapeStrategy
-            strategy=_TapeStrategy(_prepared,_tape,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity, frozen_orders=frozen_orders, cash_exhaustion_policy=cash_exhaustion_policy)
+            strategy=_TapeStrategy(_prepared,_tape,signal,initial_cash,participation_rate,native,fee,cash_module,liquidity, frozen_orders=frozen_orders, cash_exhaustion_policy=cash_exhaustion_policy, participation_policy=participation_policy)
         eng.add_strategy(strategy)
         bar_types={};statistics=dict(data_mode=data_mode,execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,market_events=0,boundary_events=0,peak_batch_events=0)
         if data_mode=='full':
@@ -971,9 +1000,10 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
                 liquidity.events.clear(); liquidity.remaining.clear(); liquidity.active.clear(); liquidity.intrabar.clear(); liquidity.consumed.clear()
             eng.end()
         if len(strategy.nav)!=len(sessions):raise RuntimeError("Missing daily reconciliation")
-        if _prepared is not None and _prepared.unresolved_entitlements:
+        effective_unresolved = tuple(_prepared.unresolved_entitlements) if (_prepared is not None and _prepared.unresolved_entitlements) else tuple(unresolved_entitlements)
+        if effective_unresolved:
             from engine.company_action_admission import verify_zero_entitlements
-            verify_zero_entitlements(strategy.nav, _prepared.unresolved_entitlements)
+            verify_zero_entitlements(strategy.nav, effective_unresolved)
         native_cash=D(str(round(eng.portfolio.account(SIM).balance_total(CNY).as_double(), 2)))
         orders=[{'id':str(o.client_order_id),'status':o.status.name,'quantity':str(o.quantity),'filled_quantity':str(o.filled_qty),
                  **({'price': str(o.price)} if getattr(o, 'price', None) is not None else {}),
@@ -1034,7 +1064,7 @@ def _run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=()
         finally:eng.dispose()
 
 
-def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy='strict', frozen_orders=None):
+def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(), actions=None, initial_cash=D(100000), participation_rate=.01, trading_days=None, fee_model=None, portfolio_signal=None, slippage_bps=0, strategy_id=None, strategy_params=None, data_snapshot_id=None, data_mode='full', execution_mode='synthetic_l2', cash_exhaustion_policy='reject', participation_policy='reject', corporate_action_gate_policy='strict', unresolved_entitlements=(), frozen_orders=None):
     """Validate raw inputs and run one isolated shared-cash portfolio."""
     if actions is not None and not corporate_actions:
         corporate_actions = actions
@@ -1042,7 +1072,7 @@ def run_backtest(instruments, bars, rules, signal=None, *, corporate_actions=(),
         initial_cash=initial_cash,participation_rate=participation_rate,trading_days=trading_days,
         fee_model=fee_model,portfolio_signal=portfolio_signal,slippage_bps=slippage_bps,
         strategy_id=strategy_id,strategy_params=strategy_params,data_snapshot_id=data_snapshot_id,data_mode=data_mode,
-        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,corporate_action_gate_policy=corporate_action_gate_policy,frozen_orders=frozen_orders)
+        execution_mode=execution_mode,cash_exhaustion_policy=cash_exhaustion_policy,participation_policy=participation_policy,corporate_action_gate_policy=corporate_action_gate_policy,unresolved_entitlements=unresolved_entitlements,frozen_orders=frozen_orders)
 
 
 def run_prepared_backtest(prepared, signal=None, **run_options):
@@ -1064,7 +1094,8 @@ def run_frozen_orders_backtest(
     instruments, bars, rules, frozen_orders, *,
     corporate_actions=(), actions=None, initial_cash=D(100000),
     participation_rate=.01, trading_days=None, fee_model=None, data_mode='orders',
-    execution_mode='synthetic_l2', cash_exhaustion_policy='reject', corporate_action_gate_policy='strict', **kwargs
+    execution_mode='synthetic_l2', cash_exhaustion_policy='reject', participation_policy='reject',
+    corporate_action_gate_policy='strict', unresolved_entitlements=(), **kwargs
 ) -> BacktestResult:
     """Run backtest directly executing frozen orders from upstream (e.g. VectorBT)."""
     if actions is not None and not corporate_actions:
@@ -1074,13 +1105,14 @@ def run_frozen_orders_backtest(
     from engine.order_tape import prepare_order_tape
     from engine.tape_replay import run_order_tape
 
-    _prep = kwargs.pop('_prepared', None)
+    _prep = kwargs.pop('_prepared', None) or kwargs.pop('prepared', None)
     if frozen_orders is not None:
         frozen_orders = tuple(frozen_orders)
     if data_mode == 'orders' and frozen_orders is not None:
         if _prep is None:
             _prep = prepare_backtest(instruments, bars, rules, corporate_actions=corporate_actions,
-                trading_days=trading_days, corporate_action_gate_policy=corporate_action_gate_policy)
+                trading_days=trading_days, unresolved_entitlements=unresolved_entitlements,
+                corporate_action_gate_policy=corporate_action_gate_policy)
         if type(_prep) is not PreparedBacktest:
             raise TypeError('PreparedBacktest required')
         _prep.assert_compatible()
@@ -1089,7 +1121,9 @@ def run_frozen_orders_backtest(
             return run_order_tape(_prep, prepare_order_tape(_prep, ()), frozen_orders=frozen_orders,
                 initial_cash=initial_cash, participation_rate=participation_rate, fee_model=fee_model,
                 execution_mode=execution_mode, cash_exhaustion_policy=cash_exhaustion_policy,
-                corporate_action_gate_policy=corporate_action_gate_policy, **kwargs)
+                participation_policy=participation_policy,
+                corporate_action_gate_policy=corporate_action_gate_policy,
+                unresolved_entitlements=unresolved_entitlements, **kwargs)
         instruments, bars, rules, trading_days = _prep.instruments, _prep.bars, _prep.rules, _prep.sessions
         data_mode = 'full'  # Minute orders can remain active across multiple bars.
 
@@ -1098,6 +1132,8 @@ def run_frozen_orders_backtest(
         initial_cash=initial_cash, participation_rate=participation_rate, trading_days=trading_days,
         fee_model=fee_model, data_mode=data_mode, frozen_orders=frozen_orders,
         execution_mode=execution_mode, cash_exhaustion_policy=cash_exhaustion_policy,
-        corporate_action_gate_policy=corporate_action_gate_policy, _prepared=_prep, **kwargs
+        participation_policy=participation_policy,
+        corporate_action_gate_policy=corporate_action_gate_policy,
+        unresolved_entitlements=unresolved_entitlements, _prepared=_prep, **kwargs
     )
 

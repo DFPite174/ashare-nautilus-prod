@@ -27,12 +27,18 @@ class BarLiquidity(FillModel):
         self.affordable=None
         self.slippage_bps=Decimal(str(slippage_bps))
 
-    def execution_price(self, price, side, instrument, limit=None):
+    def execution_price(self, price, side, instrument, limit=None, *, down_limit=None, up_limit=None):
         px=Decimal(str(price))
         tick=Decimal(str(instrument.price_increment))
         buy=side==OrderSide.BUY
         px=px*(1+(self.slippage_bps/10000 if buy else -self.slippage_bps/10000))
         px=(px/tick).to_integral_value(rounding=ROUND_CEILING if buy else ROUND_FLOOR)*tick
+        if buy and up_limit is not None:
+            cap_px=(Decimal(str(up_limit))/tick).to_integral_value(rounding=ROUND_FLOOR)*tick
+            px=min(px,cap_px)
+        elif not buy and down_limit is not None:
+            floor_px=(Decimal(str(down_limit))/tick).to_integral_value(rounding=ROUND_CEILING)*tick
+            px=max(px,floor_px)
         if limit is not None:
             px=min(px,Decimal(str(limit))) if buy else max(px,Decimal(str(limit)))
         return Price.from_str(format(px,f'.{instrument.price_precision}f'))
@@ -44,8 +50,8 @@ class BarLiquidity(FillModel):
         self.intrabar[iid]=intrabar
         if key not in self.remaining:
             self.remaining[key]=cap
-        elif intrabar and key in self.consumed:
-            self.remaining[key]=max(0, cap - self.consumed[key])
+        elif intrabar:
+            self.remaining[key]=max(0, cap - self.consumed.get(key, 0))
 
     def consume(self,iid,quantity):
         key=self.active[str(iid)]

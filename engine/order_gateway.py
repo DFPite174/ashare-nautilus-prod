@@ -213,6 +213,8 @@ class AShareOrderGateway:
         rule: Dict[str, Any],
         bar: Dict[str, Any],
         benchmark_price: Optional[float] = None,
+        *,
+        enforce_collar: Optional[bool] = None,
     ) -> OrderValidationResult:
         """
         在提交至撮合引擎前执行严格风控拦截并原子预留库存 (N03 & N04)
@@ -283,7 +285,7 @@ class AShareOrderGateway:
             if qty != total_held and (qty < sell_min or (qty % sell_step != 0)):
                 return OrderValidationResult(
                     is_valid=False,
-                    rejection_reason=f"INVALID_LOT_SIZE: Non-liquidation sell {qty} must be multiple of {sell_step}",
+                    rejection_reason=f"INVALID_LOT_SIZE: Non-liquidation sell {qty} must be at least {sell_min} and multiple of {sell_step}",
                 )
 
         # 4. 行情数据完备性与有限性校验 (N04)
@@ -344,7 +346,7 @@ class AShareOrderGateway:
             if not math.isfinite(order_price) or order_price <= 0:
                 return OrderValidationResult(is_valid=False, rejection_reason="INVALID_ORDER_PRICE: Order price must be positive and finite")
 
-            if session_phase in ("CONTINUOUS", "CONTINUOUS_AUCTION"):
+            if enforce_collar is not False and session_phase in ("CONTINUOUS", "CONTINUOUS_AUCTION"):
                 if limit_state in ("BOUNDED", "UNBOUNDED"):
                     if benchmark_price is None or not isinstance(benchmark_price, (int, float)) or not math.isfinite(benchmark_price) or benchmark_price <= 0:
                         return OrderValidationResult(

@@ -34,12 +34,12 @@ def build_events(bars,rules,native,rate,liquidity,bar_types,active_symbols=None,
         day_cap=int(Decimal(b.volume)*rate);iid=str(inst.id);key=(b.symbol,end)
         daily=b.start.astimezone(TZ)==at(b.start.astimezone(TZ).date(),9,30) and b.end.astimezone(TZ)==at(b.end.astimezone(TZ).date(),15)
         if b.open_volume is not None:
-            open_cap = int(Decimal(b.open_volume) * rate)
+            open_cap = min(int(Decimal(b.open_volume) * rate), b.volume)
         elif b.volume == 0:
             # A verified zero-trade bar has no executable price.
             open_cap = 0
         else:
-            open_cap = int(Decimal(history_vol.get(b.symbol, 0)) * rate)
+            open_cap = min(int(Decimal(history_vol.get(b.symbol, 0)) * rate), b.volume)
         if b.volume > 0:
             history_vol[b.symbol] = b.volume
         precision=inst.price_precision;px_fmt=f'.{precision}f'

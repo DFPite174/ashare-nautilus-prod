@@ -5,6 +5,7 @@ import json
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from engine.company_action_admission import resolve_actions
 from engine.reproducibility import digest
 
 
@@ -22,28 +23,6 @@ def check_output_location(destination, *protected):
         if source.is_relative_to(destination) or destination.is_relative_to(source):
             raise ValueError('Output must not overlap protected inputs')
     return destination
-
-
-def resolve_actions(rows, resolutions):
-    output = list(rows)
-    audit = []
-    seen = set()
-    for rule in resolutions:
-        key = rule['symbol'], rule['ex_date']
-        if key in seen or not rule.get('evidence_url') or not rule.get('reason'):
-            raise ValueError('Duplicate or undocumented action resolution')
-        seen.add(key)
-        group = [r for r in output if (r['ts_code'], r.get('ex_date')) == key]
-        if sorted(digest(r) for r in group) != rule['expected_row_sha256']:
-            raise ValueError(f'Action source fingerprint changed: {key}')
-        canonical = rule['canonical']
-        if (canonical['ts_code'], canonical['ex_date']) != key:
-            raise ValueError('Canonical action identity mismatch')
-        output = [r for r in output if (r['ts_code'], r.get('ex_date')) != key]
-        output.append(dict(canonical))
-        audit.append(dict(symbol=key[0], ex_date=key[1], input_sha256=rule['expected_row_sha256'],
-            output_sha256=digest(canonical), evidence_url=rule['evidence_url'], reason=rule['reason']))
-    return output, audit
 
 
 def build_snapshot(root, destination, symbols, start, end, resolution_file):

@@ -4,12 +4,13 @@ from collections import namedtuple
 from datetime import datetime, timedelta
 from decimal import Decimal
 import hashlib
+import json
 from pathlib import Path
 import pyarrow.dataset as ds
 
 from contracts import Instrument, Venue, CorporateAction
 from engine.backtest import BacktestBar, at
-from engine.company_action_admission import filter_entitlement_rows, load_company_action_facts
+from engine.company_action_admission import filter_entitlement_rows, load_company_action_facts, resolve_actions
 from engine.prepared import prepare_backtest
 from engine.reproducibility import digest
 
@@ -47,12 +48,23 @@ class LakeInputs:
             corporate_actions=self.corporate_actions, unresolved_entitlements=self.unresolved_entitlements)
 
 
-def load_tushare_lake(root, symbols, start, end):
+def _is_star_market(symbol, master_row):
+    market = str(master_row.get('market') or '').strip()
+    if market:
+        return market == '科创板'
+    return symbol.startswith(('688', '689'))
+
+
+def load_tushare_lake(root, symbols, start, end, *, fractional_policy='reject', action_resolutions=None, delist_dates=None):
     """Load explicit SSE/SZSE equities; missing facts raise, suspension stays explicit.
 
     Current stock master provides listing dates, not a verified last-trading-day
-    history. This adapter does not construct a historical strategy universe.
+    history unless explicitly supplied via ``delist_dates``. This adapter does not
+    construct a historical strategy universe.
     """
+    if fractional_policy not in {'floor', 'reject', 'cash_in_lieu'}:
+        raise ValueError(f"Invalid fractional_policy: {fractional_policy}")
+    delist_map = {sym: parse_day(dt) for sym, dt in (delist_dates or {}).items()}
     root=Path(root);base=root/'lake';symbols=sorted(set(symbols))
     start,end=parse_day(start),parse_day(end)
     if not symbols or start>end or any(not s.endswith(('.SH','.SZ')) for s in symbols):
@@ -74,9 +86,12 @@ def load_tushare_lake(root, symbols, start, end):
     master=read('meta/stock_basic.parquet',codes)
     indexed={r['ts_code']:r for r in master}
     if len(indexed)!=len(symbols) or len(master)!=len(indexed):raise ValueError('Missing or duplicate security master')
+    star_symbols = {s for s in symbols if _is_star_market(s, indexed[s])}
     instruments=[Instrument(symbol=s,exchange=Venue.SSE if s.endswith('.SH') else Venue.SZSE,
-        list_date=parse_day(indexed[s]['list_date']),lot_size=100,
-        min_order_qty=200 if s.startswith('688') else 100) for s in symbols]
+        list_date=parse_day(indexed[s]['list_date']),
+        delist_date=delist_map.get(s) or parse_day(indexed[s].get('delist_date')),
+        lot_size=100,
+        min_order_qty=200 if s in star_symbols else 100) for s in symbols]
     calendar=read('meta/trade_cal.parquet', (ds.field('cal_date')>=start.strftime('%Y%m%d')) &
         (ds.field('cal_date')<=end.strftime('%Y%m%d')))
     official={}
@@ -115,16 +130,17 @@ def load_tushare_lake(root, symbols, start, end):
     bars=[];rules={}
     boundaries={day:(at(day,9,30),at(day,15)) for day in sessions}
     for inst in instruments:
+        is_star = inst.symbol in star_symbols
         for day in sessions:
-            if inst.list_date and day<inst.list_date:continue
+            if (inst.list_date and day<inst.list_date) or (inst.delist_date and day>inst.delist_date):continue
             key=inst.symbol,day;r=daily.pop(key,None);band=bands.pop(key,None)
             status=halted.get(key,'OPEN')
             if r is None and status=='OPEN':raise ValueError(f'Missing OPEN bar: {key}')
             if band is None and status=='OPEN':raise ValueError(f'Missing official price band: {key}; unlimited sessions require explicit rules')
             rules[key]=dict(trade_status=status,limit_state='BOUNDED' if band else 'UNAVAILABLE',
-                buy_min=inst.min_order_qty,buy_step=1 if inst.symbol.startswith('688') else 100,
-                sell_min=200 if inst.symbol.startswith('688') else 100,sell_step=1 if inst.symbol.startswith('688') else 100,
-                max_order=100000 if inst.symbol.startswith('688') else 1000000)
+                buy_min=inst.min_order_qty,buy_step=1 if is_star else 100,
+                sell_min=200 if is_star else 100,sell_step=1 if is_star else 100,
+                max_order=100000 if is_star else 1000000)
             if band:rules[key].update(up_limit=band.up_limit,down_limit=band.down_limit)
             if r is not None:
                 vol=Decimal(str(r.volume_shares))
@@ -137,6 +153,16 @@ def load_tushare_lake(root, symbols, start, end):
     # Include events already ex-dividend but paid/listed during the sample so they
     # cannot silently enter without the record-date and holding state required.
     action_rows=read('actions/dividend.parquet',codes)
+    res_audit = []
+    if action_resolutions is not None:
+        if isinstance(action_resolutions, (str, Path)):
+            loaded = json.loads(Path(action_resolutions).read_text(encoding='utf-8'))
+            res_list = loaded.get('resolutions', loaded) if isinstance(loaded, dict) else loaded
+        else:
+            res_list = list(action_resolutions)
+        relevant_res = [r for r in res_list if r.get('symbol') in symbols]
+        if relevant_res:
+            action_rows, res_audit = resolve_actions(action_rows, relevant_res)
     action_rows, unresolved, excluded = filter_entitlement_rows(
         action_rows, load_company_action_facts(), set(symbols), start.strftime('%Y%m%d'), end.strftime('%Y%m%d'))
     actions={};duplicates=0;unimplemented=0
@@ -163,7 +189,7 @@ def load_tushare_lake(root, symbols, start, end):
         if record<start:raise ValueError('Corporate action record date before sample; extend start')
         a=CorporateAction(symbol=r['ts_code'],record_date=record,ex_date=ex,pay_date=pay,
             announcement_date=parse_day(r.get('imp_ann_date') or r.get('ann_date')),
-            cash_div=cash,bonus_ratio=bonus,reserve_ratio=reserve,share_listing_date=listing,fractional_policy='reject')
+            cash_div=cash,bonus_ratio=bonus,reserve_ratio=reserve,share_listing_date=listing,fractional_policy=fractional_policy)
         key=a.symbol,a.ex_date
         if key in actions:
             if actions[key]!=a:raise ValueError(f'Conflicting corporate action: {key}')
@@ -174,6 +200,12 @@ def load_tushare_lake(root, symbols, start, end):
         security_universe='explicit symbols; current master listing date only',
         deduplicated_actions=duplicates,excluded_unimplemented_actions=unimplemented,
         partial_suspension_policy='DAY_BLOCKED')
+    if fractional_policy != 'reject':
+        snapshot['fractional_policy'] = fractional_policy
+    if res_audit:
+        snapshot['action_resolution_audit'] = res_audit
+    if delist_map:
+        snapshot['delist_dates'] = {k: v.isoformat() for k, v in sorted(delist_map.items()) if v is not None}
     if unresolved or excluded:
         snapshot.update(unresolved_entitlements=unresolved, excluded_entitlement_rows=excluded)
     snapshot['snapshot_id']=digest(snapshot)
